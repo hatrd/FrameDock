@@ -14,6 +14,13 @@ internal sealed class MpvClient : IAsyncDisposable
     private readonly StreamReader reader;
     private readonly StreamWriter writer;
     private readonly SemaphoreSlim writeLock = new(1, 1);
+    private readonly SemaphoreSlim seekLock = new(1, 1);
+    private sealed class SeekOperation
+    {
+        public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool Started { get; set; }
+    }
+    private volatile SeekOperation? seekOperation;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> requests = new();
     private readonly CancellationTokenSource lifetime = new();
     private int nextRequest;
@@ -67,6 +74,13 @@ internal sealed class MpvClient : IAsyncDisposable
             {
                 using var document = JsonDocument.Parse(line);
                 var root = document.RootElement;
+                if (root.TryGetProperty("event", out var playbackEvent) && seekOperation is { } operation)
+                {
+                    var eventName = playbackEvent.GetString();
+                    if (eventName is "seek" or "file-loaded") operation.Started = true;
+                    if (eventName == "playback-restart" && operation.Started || eventName == "end-file")
+                        operation.Completion.TrySetResult();
+                }
                 if (root.TryGetProperty("request_id", out var id) && id.TryGetInt32(out var requestId) &&
                     requests.TryRemove(requestId, out var pending))
                     pending.TrySetResult(root.Clone());
@@ -85,6 +99,7 @@ internal sealed class MpvClient : IAsyncDisposable
         {
             foreach (var pending in requests.Values) pending.TrySetException(new IOException("mpv 连接已关闭。"));
             requests.Clear();
+            seekOperation?.Completion.TrySetException(new IOException("mpv 连接已关闭。"));
         }
     }
 
@@ -103,13 +118,27 @@ internal sealed class MpvClient : IAsyncDisposable
         return reply.TryGetProperty("data", out var data) ? data.Clone() : default;
     }
 
-    public Task LoadAsync(string path) => CommandAsync("loadfile", path, "replace");
+    public Task LoadAsync(string path) => RestartPlaybackAsync("loadfile", path, "replace");
     public Task PauseAsync(bool pause) => CommandAsync("set_property", "pause", pause);
-    public Task SeekAsync(double seconds) => CommandAsync("seek", seconds, "absolute+exact");
-    public Task JumpAsync(double seconds) => CommandAsync("seek", seconds, "relative+exact");
+    public Task SeekAsync(double seconds) => RestartPlaybackAsync("seek", seconds, "absolute+exact");
+    public Task JumpAsync(double seconds) => RestartPlaybackAsync("seek", seconds, "relative+exact");
     public Task StepAsync(bool backward) => CommandAsync(backward ? "frame-back-step" : "frame-step");
     public Task StopAsync() => CommandAsync("stop");
     public Task<JsonElement> PropertyAsync(string name) => CommandAsync("get_property", name);
+
+    private async Task RestartPlaybackAsync(params object?[] command)
+    {
+        await seekLock.WaitAsync(lifetime.Token);
+        var operation = new SeekOperation();
+        seekOperation = operation;
+        try
+        {
+            await CommandAsync(command);
+            // A command reply acknowledges the request; playback-restart means the new frame is ready.
+            await operation.Completion.Task.WaitAsync(TimeSpan.FromSeconds(15), lifetime.Token);
+        }
+        finally { seekOperation = null; seekLock.Release(); }
+    }
 
     public async Task SetTrackAsync(string kind, int? ffIndex)
     {

@@ -64,6 +64,13 @@ internal static class OutputNames
         return Path.Combine(Path.GetDirectoryName(media.Path)!,
             $"{Safe(Path.GetFileNameWithoutExtension(media.Path))}__{Time(start)}-{Time(end)}__{a}_{s}_{mode}_{Id(key)}{extension}");
     }
+
+    public static string ClipCover(string clipPath, MediaInfo media, double position, int? subtitleIndex)
+    {
+        var key = $"{SourceState(media.Path)}|{position:R}|{subtitleIndex}";
+        return Path.Combine(Path.GetDirectoryName(clipPath)!,
+            $"{Path.GetFileNameWithoutExtension(clipPath)}__cover_{Time(position)}_{Id(key)}.png");
+    }
 }
 
 internal static class Exporter

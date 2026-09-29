@@ -10,9 +10,11 @@ internal sealed class MainForm : Form
     {
         public override string ToString() => Label;
     }
-    private sealed class Job(ExportSpec spec)
+    private sealed record CoverFrame(MediaInfo Media, double Position, int? SubtitleIndex, byte[] Png, SourceStamp Source);
+    private sealed class Job(ExportSpec spec, CoverFrame? cover = null)
     {
         public ExportSpec Spec { get; } = spec;
+        public CoverFrame? Cover { get; set; } = cover;
         public CancellationTokenSource Cancellation { get; } = new();
         public string State { get; set; } = "排队";
         public string? Failure { get; set; }
@@ -29,7 +31,10 @@ internal sealed class MainForm : Form
     private readonly ComboBox subtitle = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 205 };
     private readonly ComboBox previewScale = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 86 };
     private readonly CheckBox copy = new() { Text = "纯复制（不重编码）", Checked = true, AutoSize = true, ForeColor = Color.White };
-    private readonly CheckBox startup = new() { Text = "登录时启动", AutoSize = true, ForeColor = Color.White };
+    private readonly CheckBox startup = new() { Text = "开机时启动", AutoSize = true, ForeColor = Color.White };
+    private readonly PictureBox coverPreview = new() { Size = new Size(86, 50), SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.Black };
+    private readonly Label coverLabel = new() { AutoSize = false, Width = 175, Height = 50, ForeColor = Color.Gainsboro, TextAlign = ContentAlignment.MiddleLeft };
+    private readonly ToolTip tips = new();
     private readonly NumericUpDown parallel = new() { Minimum = 1, Maximum = 4, Value = 1, Width = 48 };
     private readonly ListBox jobs = new() { Dock = DockStyle.Fill, BackColor = Color.FromArgb(31, 34, 40), ForeColor = Color.White,
         BorderStyle = BorderStyle.None, IntegralHeight = false };
@@ -45,7 +50,12 @@ internal sealed class MainForm : Form
     private CancellationTokenSource? keyframeScan;
     private List<Keyframe>? keyframes;
     private bool loading;
-    private bool snapping;
+    private CoverFrame? selectedCover;
+    private bool capturingCover;
+    private bool submittingExport;
+    private bool previewingRange;
+    private double? pendingSeek;
+    private Task seekPump = Task.CompletedTask;
     private bool exiting;
     private bool exitAfterJobs;
     private double lastPosition;
@@ -57,8 +67,8 @@ internal sealed class MainForm : Form
         this.initialPath = initialPath;
         this.startInTray = startInTray;
         Text = "FrameDock";
-        MinimumSize = new Size(680, 480);
-        Size = new Size(920, 680);
+        MinimumSize = new Size(860, 680);
+        Size = new Size(1040, 800);
         BackColor = Color.FromArgb(24, 27, 32);
         ForeColor = Color.White;
         KeyPreview = true;
@@ -71,12 +81,15 @@ internal sealed class MainForm : Form
         tray = new NotifyIcon { Icon = Icon, Text = "FrameDock", Visible = true, ContextMenuStrip = menu };
         tray.DoubleClick += async (_, _) => await ShowFromTrayAsync();
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(12) };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 9, Padding = new Padding(12) };
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 90));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 120));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 148));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         Controls.Add(root);
         root.Controls.Add(video, 0, 0);
@@ -88,30 +101,54 @@ internal sealed class MainForm : Form
         readout.Controls.Add(rangeLabel);
         root.Controls.Add(readout, 0, 2);
 
+        var trimControls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+        var setStart = Button("[ 设为起点", async () => await SetBoundaryAsync(true));
+        var setEnd = Button("] 设为终点", async () => await SetBoundaryAsync(false));
+        var preview = Button("R 试听片段", PreviewRangeAsync);
+        var fit = Button("F 放大选段", () => { range.FitSelection(); return Task.CompletedTask; });
+        var overview = Button("0 全片视图", () => { range.ResetView(); return Task.CompletedTask; });
+        var reset = Button("重置范围", () => { range.ResetRange(); return Task.CompletedTask; });
+        trimControls.Controls.AddRange([setStart, setEnd, preview, fit, overview, reset]);
+        root.Controls.Add(trimControls, 0, 3);
+        tips.SetToolTip(setStart, "暂停在当前画面，把左边界设到播放指针（[）。");
+        tips.SetToolTip(setEnd, "暂停在当前画面，把右边界设到播放指针（]）。");
+        tips.SetToolTip(range, "上方绿/橙手柄拖边界，下方白色指针拖播放位置。滚轮缩放；Shift+滚轮或右键拖动平移；底部总览定位视角。");
+
         var controls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
         var open = Button("打开视频", async () => await PickVideoAsync());
         var play = Button("播放/暂停", async () => await TogglePauseAsync());
-        var shot = Button("S 截图", async () => await ScreenshotAsync());
-        var export = Button("D 导出", async () => await SubmitExportAsync());
-        controls.Controls.AddRange([open, play, shot, export, copy]);
-        root.Controls.Add(controls, 0, 3);
+        var export = Button("D 导出片段", async () => await SubmitExportAsync());
+        controls.Controls.AddRange([open, play, export, copy]);
+        root.Controls.Add(controls, 0, 4);
+        tips.SetToolTip(copy, "纯复制会从所选起点之前的关键帧开始，可能多留一小段头部。需要准确去头时取消勾选。");
 
-        var lower = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
-        lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 73));
-        lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 27));
+        var coverControls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+        var chooseCover = Button("C 选封面", SelectCoverAsync);
+        var shot = Button("S 导出封面", async () => await ScreenshotAsync());
+        var bundle = Button("Shift+D 片段 + 封面", async () => await SubmitExportAsync(true));
+        var clearCover = Button("清除封面", () => { ClearCover(); return Task.CompletedTask; });
+        coverControls.Controls.AddRange([coverPreview, coverLabel, chooseCover, shot, bundle, clearCover]);
+        root.Controls.Add(coverControls, 0, 5);
+        tips.SetToolTip(chooseCover, "锁定当前画面和字幕为封面。之后移动播放指针不会改变它。");
+        tips.SetToolTip(shot, "导出已选封面；尚未选封面时导出当前画面。Shift+S 始终截取当前画面。");
+        tips.SetToolTip(bundle, "将片段加入后台队列，并保存同名 PNG 封面。尚未选封面时使用当前画面。");
+
+        var lower = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+        lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        lower.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         lower.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         lower.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.Controls.Add(lower, 0, 4);
+        root.Controls.Add(lower, 0, 6);
         var selectors = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
         selectors.Controls.AddRange([TinyLabel("音轨"), audio, TinyLabel("字幕"), subtitle,
             TinyLabel("预览"), previewScale]);
         lower.Controls.Add(selectors, 0, 0);
         var settings = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
         settings.Controls.AddRange([TinyLabel("并发"), parallel, startup]);
-        lower.Controls.Add(settings, 1, 0);
-        lower.Controls.Add(jobs, 0, 1);
-        lower.SetColumnSpan(jobs, 2);
-        root.Controls.Add(status, 0, 5);
+        lower.Controls.Add(settings, 0, 1);
+        lower.Controls.Add(jobs, 0, 2);
+        root.Controls.Add(new Label { Dock = DockStyle.Fill, ForeColor = Color.Silver, Text = "滚轮缩放 · Shift+滚轮平移 · ←/→ 逐帧 · ↑/↓ 跳秒 · [ / ] 去头尾 · C 选封面 · Shift+D 一起导出", AutoEllipsis = true }, 0, 7);
+        root.Controls.Add(status, 0, 8);
 
         var jobsMenu = new ContextMenuStrip();
         jobsMenu.Items.Add("取消所选任务", null, (_, _) => CancelSelectedJob());
@@ -131,7 +168,6 @@ internal sealed class MainForm : Form
         DragDrop += OnDragDrop;
         video.DragEnter += OnDragEnter;
         video.DragDrop += OnDragDrop;
-        KeyDown += OnKeyDown;
         FormClosing += OnClosing;
         Shown += async (_, _) => {
             if (this.startInTray && this.initialPath is null) Hide();
@@ -140,12 +176,16 @@ internal sealed class MainForm : Form
         };
         LoadSettings();
         SetStatus("把 MKV 或 MP4 拖进窗口。");
+        ClearCover();
+        UpdatePosition();
         UpdateRange();
     }
 
     private static Button Button(string text, Func<Task> action)
     {
-        var button = new Button { Text = text, AutoSize = true, Height = 30, Margin = new Padding(2) };
+        var button = new Button { Text = text, AutoSize = true, Height = 30, Margin = new Padding(2),
+            FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(43, 49, 59), ForeColor = Color.White };
+        button.FlatAppearance.BorderColor = Color.FromArgb(78, 88, 104);
         button.Click += async (_, _) => await action();
         return button;
     }
@@ -195,16 +235,25 @@ internal sealed class MainForm : Form
 
     private async Task OpenVideoAsync(string path)
     {
+        if (loading || capturingCover || submittingExport)
+        {
+            SetStatus("正在读取画面或提交导出，请稍后再打开视频。");
+            return;
+        }
         try
         {
             loading = true;
+            previewingRange = false;
+            await seekPump;
             keyframeScan?.Cancel();
             if (player is not null) { await player.DisposeAsync(); player = null; }
             var info = await Probe.ReadAsync(path);
             media = info;
+            ClearCover();
             keyframes = null;
             lastPosition = 0;
             range.Duration = info.Duration;
+            UpdatePosition();
             audio.Items.Clear();
             audio.Items.Add(new TrackOption(null, "无音频"));
             foreach (var track in info.Audio) audio.Items.Add(new TrackOption(track.Index, track.Label));
@@ -244,9 +293,20 @@ internal sealed class MainForm : Form
         player = await MpvClient.StartAsync(video.Handle);
         try
         {
+            var attachedPlayer = player;
             player.PositionChanged += position => {
                 if (!IsHandleCreated || IsDisposed) return;
-                BeginInvoke(() => { lastPosition = position; range.Position = position; UpdatePosition(); });
+                BeginInvoke(() => {
+                    if (player != attachedPlayer || loading || !seekPump.IsCompleted || range.IsScrubbing) return;
+                    lastPosition = position;
+                    range.Position = position;
+                    UpdatePosition();
+                    if (previewingRange && position >= range.End)
+                    {
+                        previewingRange = false;
+                        _ = StopRangePreviewAsync();
+                    }
+                });
             };
             await player.LoadAsync(path);
             await WaitForTracksAsync();
@@ -293,10 +353,78 @@ internal sealed class MainForm : Form
         catch (Exception error) { Error(error); }
     }
 
-    private async Task SeekAsync(double time)
+    private Task SeekAsync(double time)
+    {
+        if (player is null || loading) return Task.CompletedTask;
+        previewingRange = false;
+        pendingSeek = Math.Clamp(time, 0, range.Duration);
+        if (seekPump.IsCompleted) seekPump = PumpSeekAsync();
+        return seekPump;
+    }
+
+    private async Task PumpSeekAsync()
+    {
+        var target = player;
+        if (target is null) return;
+        try
+        {
+            await target.PauseAsync(true);
+            while (pendingSeek is double time && player == target)
+            {
+                pendingSeek = null;
+                await target.SeekAsync(time);
+                if (pendingSeek is not null || player != target) continue;
+                lastPosition = (await target.PropertyAsync("time-pos")).GetDouble();
+                if (pendingSeek is not null) continue;
+                if (!range.IsScrubbing) range.Position = lastPosition;
+                UpdatePosition();
+            }
+        }
+        catch (Exception error) { SetStatus(error.Message); }
+        finally { pendingSeek = null; }
+    }
+
+    private async Task SetBoundaryAsync(bool isStart)
+    {
+        if (player is null || loading) return;
+        try
+        {
+            await seekPump;
+            await player.PauseAsync(true);
+            previewingRange = false;
+            var time = (await player.PropertyAsync("time-pos")).GetDouble();
+            if (isStart && time >= range.End || !isStart && time <= range.Start)
+            {
+                SetStatus(isStart ? "起点必须早于终点；先移动终点或重置范围。" : "终点必须晚于起点；先移动起点或重置范围。");
+                return;
+            }
+            if (isStart) range.Start = time; else range.End = time;
+            lastPosition = range.Position = time;
+            range.EnsureVisible(time);
+            UpdatePosition();
+            SetStatus($"已将{(isStart ? "起点" : "终点")}设为 {Clock(time)}。");
+        }
+        catch (Exception error) { Error(error); }
+    }
+
+    private async Task PreviewRangeAsync()
+    {
+        if (player is null || loading) return;
+        try
+        {
+            await SeekAsync(range.Start);
+            range.EnsureVisible(range.Start);
+            previewingRange = true;
+            await player.PauseAsync(false);
+            SetStatus("正在试听所选片段，到终点自动暂停。空格可随时暂停。");
+        }
+        catch (Exception error) { previewingRange = false; Error(error); }
+    }
+
+    private async Task StopRangePreviewAsync()
     {
         if (player is null) return;
-        try { await player.SeekAsync(time); }
+        try { await SeekAsync(range.End); SetStatus("片段试听结束。"); }
         catch (Exception error) { SetStatus(error.Message); }
     }
 
@@ -309,19 +437,15 @@ internal sealed class MainForm : Form
 
     private void UpdateRange()
     {
-        if (snapping || IsDisposed) return;
+        if (IsDisposed) return;
         var actual = ActualStart();
-        if (copy.Checked && keyframes is not null && Math.Abs(actual - range.Start) > 0.001)
-        {
-            snapping = true;
-            range.Start = actual;
-            snapping = false;
-        }
-        rangeLabel.Text = $"范围 {Clock(range.Start)}–{Clock(range.End)}  |  预计 {Clock(actual)}–{Clock(range.End)}";
+        rangeLabel.Text = $"保留 {Clock(range.Start)}–{Clock(range.End)}  ({range.End - range.Start:F3}s)" +
+            (copy.Checked ? keyframes is null ? "  · 切点分析中" : $"  · 复制起点 {Clock(actual)}" : "  · 精确截取");
     }
 
     private void UpdatePosition() => positionLabel.Text = $"画面 {Clock(lastPosition)}";
-    private static string Clock(double time) => TimeSpan.FromSeconds(Math.Max(0, time)).ToString(@"hh\:mm\:ss\.fff", CultureInfo.InvariantCulture);
+    private static string Clock(double time) => TimeSpan.FromSeconds(Math.Max(0, time)).ToString(
+        time >= 3600 ? @"hh\:mm\:ss\.fff" : @"mm\:ss\.fff", CultureInfo.InvariantCulture);
 
     private async Task TogglePauseAsync()
     {
@@ -329,71 +453,156 @@ internal sealed class MainForm : Form
         try
         {
             var paused = await player.PropertyAsync("pause");
+            previewingRange = false;
             await player.PauseAsync(!paused.GetBoolean());
         }
         catch (Exception error) { Error(error); }
     }
 
-    private async void OnKeyDown(object? sender, KeyEventArgs e)
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        if (player is null || e.Control || e.Alt) return;
+        if ((keyData & (Keys.Control | Keys.Alt)) != 0) return base.ProcessCmdKey(ref msg, keyData);
+        var key = keyData & Keys.KeyCode;
+        // Let selectors keep their own arrows and typing; buttons and the timeline use editing shortcuts.
+        if (ActiveControl is ComboBox or NumericUpDown or TextBoxBase || parallel.ContainsFocus)
+            return base.ProcessCmdKey(ref msg, keyData);
+        if (key is Keys.D0 or Keys.NumPad0) { range.ResetView(); return true; }
+        if (key == Keys.F) { range.FitSelection(); return true; }
+        if (player is null || loading) return base.ProcessCmdKey(ref msg, keyData);
+        if (key is not (Keys.Space or Keys.H or Keys.Left or Keys.L or Keys.Right or Keys.J or Keys.Down or
+            Keys.K or Keys.Up or Keys.S or Keys.D or Keys.C or Keys.R or Keys.OemOpenBrackets or Keys.OemCloseBrackets or Keys.Home or Keys.End))
+            return base.ProcessCmdKey(ref msg, keyData);
+        _ = HandleShortcutAsync(key, (keyData & Keys.Shift) != 0);
+        return true;
+    }
+
+    private async Task HandleShortcutAsync(Keys key, bool shift)
+    {
+        if (player is null) return;
         try
         {
-            switch (e.KeyCode)
+            await seekPump;
+            switch (key)
             {
                 case Keys.Space: await TogglePauseAsync(); break;
-                case Keys.H: case Keys.Left: await player.PauseAsync(true); await player.StepAsync(true); break;
-                case Keys.L: case Keys.Right: await player.PauseAsync(true); await player.StepAsync(false); break;
-                case Keys.J: case Keys.Down: await player.JumpAsync(-1); break;
-                case Keys.K: case Keys.Up: await player.JumpAsync(1); break;
-                case Keys.S: await ScreenshotAsync(); break;
-                case Keys.D: await SubmitExportAsync(); break;
+                case Keys.H: case Keys.Left: previewingRange = false; await player.PauseAsync(true); await player.StepAsync(true); break;
+                case Keys.L: case Keys.Right: previewingRange = false; await player.PauseAsync(true); await player.StepAsync(false); break;
+                case Keys.J: case Keys.Down: previewingRange = false; await player.PauseAsync(true); await player.JumpAsync(-1); break;
+                case Keys.K: case Keys.Up: previewingRange = false; await player.PauseAsync(true); await player.JumpAsync(1); break;
+                case Keys.OemOpenBrackets: await SetBoundaryAsync(true); break;
+                case Keys.OemCloseBrackets: await SetBoundaryAsync(false); break;
+                case Keys.Home: await SeekAsync(range.Start); break;
+                case Keys.End: await SeekAsync(range.End); break;
+                case Keys.R: await PreviewRangeAsync(); break;
+                case Keys.C: await SelectCoverAsync(); break;
+                case Keys.S: await ScreenshotAsync(shift); break;
+                case Keys.D: await SubmitExportAsync(shift); break;
                 default: return;
             }
-            e.Handled = true;
-            e.SuppressKeyPress = true;
+            if (key is Keys.H or Keys.Left or Keys.L or Keys.Right or Keys.J or Keys.Down or Keys.K or Keys.Up or Keys.Home or Keys.End)
+            {
+                lastPosition = (await player.PropertyAsync("time-pos")).GetDouble();
+                range.Position = lastPosition;
+                range.EnsureVisible(lastPosition);
+                UpdatePosition();
+            }
         }
         catch (Exception error) { Error(error); }
     }
 
-    private async Task ScreenshotAsync()
+    private void ClearCover()
     {
-        if (player is null || media is null) return;
+        selectedCover = null;
+        coverPreview.Image?.Dispose();
+        coverPreview.Image = null;
+        coverLabel.Text = "封面未锁定\n导出时使用当前画面";
+    }
+
+    private async Task<CoverFrame?> CaptureCoverAsync()
+    {
+        if (player is null || media is null || loading || capturingCover) return null;
+        capturingCover = true;
+        var source = media;
+        var target = player;
+        var temporary = Path.Combine(Path.GetTempPath(), "framedock-cover-" + Guid.NewGuid().ToString("N") + ".png");
         try
         {
-            var paused = (await player.PropertyAsync("pause")).GetBoolean();
-            await player.PauseAsync(true);
-            var position = (await player.PropertyAsync("time-pos")).GetDouble();
+            await seekPump;
+            previewingRange = false;
+            await target.PauseAsync(true);
+            var stamp = SourceStamp.Capture(source.Path);
+            var position = (await target.PropertyAsync("time-pos")).GetDouble();
             var sub = (subtitle.SelectedItem as TrackOption)?.Index;
-            var path = OutputNames.Screenshot(media, position, sub);
-            if (File.Exists(path))
-            {
-                try
-                {
-                    using var existing = Image.FromFile(path);
-                    if (existing.Width <= 0 || existing.Height <= 0) throw new InvalidOperationException("图片尺寸无效。");
-                    SetStatus("截图已存在：" + path);
-                }
-                catch (Exception error) when (error is ArgumentException or OutOfMemoryException or InvalidOperationException)
-                {
-                    ArchiveInvalid(path);
-                }
-            }
-            if (!File.Exists(path))
-            {
-                await player.ScreenshotAsync(path, sub is not null);
-                using var saved = Image.FromFile(path);
-                if (saved.Width <= 0 || saved.Height <= 0) throw new InvalidOperationException("截图尺寸无效。");
-                SetStatus("截图已保存：" + path);
-            }
-            if (!paused) await player.PauseAsync(false);
+            await target.ScreenshotAsync(temporary, sub is not null);
+            using var saved = Image.FromFile(temporary);
+            if (saved.Width <= 0 || saved.Height <= 0) throw new InvalidOperationException("封面尺寸无效。");
+            if (SourceStamp.Capture(source.Path) != stamp) throw new InvalidOperationException("源视频已变化，请重新打开后选封面。");
+            return new CoverFrame(source, position, sub, await File.ReadAllBytesAsync(temporary), stamp);
+        }
+        finally
+        {
+            capturingCover = false;
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
+    }
+
+    private async Task SelectCoverAsync()
+    {
+        try
+        {
+            var cover = await CaptureCoverAsync();
+            if (cover is null) return;
+            selectedCover = cover;
+            using var stream = new MemoryStream(cover.Png);
+            using var image = Image.FromStream(stream);
+            coverPreview.Image?.Dispose();
+            coverPreview.Image = new Bitmap(image);
+            coverLabel.Text = $"封面 {Clock(cover.Position)}\n已锁定 · {(cover.SubtitleIndex is null ? "无字幕" : "含字幕")}";
+            SetStatus("封面已锁定；可继续调整首尾，Shift+D 一起导出。");
         }
         catch (Exception error) { Error(error); }
     }
 
-    private async Task SubmitExportAsync()
+    private static async Task SaveCoverAsync(CoverFrame cover, string path)
     {
-        if (media is null) return;
+        if (SourceStamp.Capture(cover.Media.Path) != cover.Source)
+            throw new InvalidOperationException("源视频已变化，请重新打开后选封面。");
+        if (File.Exists(path))
+        {
+            try
+            {
+                using var existing = Image.FromFile(path);
+                if (existing.Width <= 0 || existing.Height <= 0) throw new InvalidOperationException("图片尺寸无效。");
+                return;
+            }
+            catch (Exception error) when (error is ArgumentException or OutOfMemoryException or InvalidOperationException)
+            {
+                ArchiveInvalid(path);
+            }
+        }
+        var temporary = path + ".partial-" + Guid.NewGuid().ToString("N");
+        try { await File.WriteAllBytesAsync(temporary, cover.Png); File.Move(temporary, path); }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+
+    private async Task ScreenshotAsync(bool currentFrame = false)
+    {
+        if (media is null || loading) return;
+        try
+        {
+            var cover = currentFrame ? await CaptureCoverAsync() : selectedCover ?? await CaptureCoverAsync();
+            if (cover is null) return;
+            var path = OutputNames.Screenshot(cover.Media, cover.Position, cover.SubtitleIndex);
+            await SaveCoverAsync(cover, path);
+            SetStatus("封面已保存：" + path);
+        }
+        catch (Exception error) { Error(error); }
+    }
+
+    private async Task SubmitExportAsync(bool includeCover = false)
+    {
+        if (media is null || loading || submittingExport || capturingCover) return;
+        submittingExport = true;
         try
         {
             if (copy.Checked && keyframes is null)
@@ -434,27 +643,43 @@ internal sealed class MainForm : Form
             var copySeek = doCopy ? Math.Max(0, (keyframes?.FindLast(frame => frame.Pts <= start + 0.0005)?.Dts ?? start) - 0.005) : (double?)null;
             var spec = new ExportSpec(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, output,
                 copySeek, SourceStamp.Capture(media.Path));
+            var cover = includeCover ? selectedCover ?? await CaptureCoverAsync() : null;
+            if (includeCover && cover is null) return;
+            if (cover is not null && (cover.Media != media || cover.Source != spec.Source))
+                throw new InvalidOperationException("源视频已变化，请重新打开后选封面。");
             if (File.Exists(output))
             {
                 try
                 {
                     await Exporter.VerifyAsync(spec, output, CancellationToken.None);
-                    SetStatus("片段已完成：" + output);
-                    return;
                 }
                 catch (Exception error) when (error is InvalidOperationException or FormatException)
                 {
                     ArchiveInvalid(output);
                 }
+                if (File.Exists(output))
+                {
+                    if (cover is not null) await SaveCoverAsync(cover, OutputNames.ClipCover(output, cover.Media, cover.Position, cover.SubtitleIndex));
+                    SetStatus((cover is null ? "片段已完成：" : "片段与封面已保存：") + output);
+                    return;
+                }
             }
-            if (activePaths.Contains(output)) { SetStatus("任务已在排队或运行：" + output); return; }
-            var job = new Job(spec);
+            if (activePaths.Contains(output))
+            {
+                var existing = jobs.Items.OfType<Job>().First(j => j.Spec.OutputPath == output && j.State is "排队" or "运行");
+                if (cover is not null && existing.Cover is null) existing.Cover = cover;
+                SetStatus("任务已在排队或运行：" + output);
+                return;
+            }
+            var job = new Job(spec, cover);
             waiting.Enqueue(job);
             activePaths.Add(output);
             jobs.Items.Add(job);
             PumpQueue();
+            SetStatus(cover is null ? "片段已加入导出队列。" : "片段与已锁定的封面已加入导出队列。");
         }
         catch (Exception error) { Error(error); }
+        finally { submittingExport = false; }
     }
 
     private static void ArchiveInvalid(string path)
@@ -471,6 +696,7 @@ internal sealed class MainForm : Form
             if (job.Cancellation.IsCancellationRequested)
             {
                 UpdateJob(job, "取消");
+                job.Cover = null;
                 activePaths.Remove(job.Spec.OutputPath);
                 job.Cancellation.Dispose();
                 continue;
@@ -501,14 +727,17 @@ internal sealed class MainForm : Form
         try
         {
             var output = await Exporter.RunAsync(job.Spec, job.Cancellation.Token);
+            if (job.Cover is { } cover)
+                await SaveCoverAsync(cover, OutputNames.ClipCover(job.Spec.OutputPath, cover.Media, cover.Position, cover.SubtitleIndex));
             UpdateJob(job, "完成");
-            SetStatus($"片段已保存（实际时长 {output.Duration:F3} 秒）：{job.Spec.OutputPath}");
+            SetStatus($"{(job.Cover is null ? "片段" : "片段与封面")}已保存（实际时长 {output.Duration:F3} 秒）：{job.Spec.OutputPath}");
         }
         catch (OperationCanceledException) { UpdateJob(job, "取消"); }
         catch (Exception error) { job.Failure = error.Message; UpdateJob(job, "失败"); SetStatus(error.Message); }
         finally
         {
             job.Cancellation.Dispose();
+            job.Cover = null;
             activePaths.Remove(job.Spec.OutputPath);
             runningJobs.Remove(job);
             PumpQueue();
@@ -540,6 +769,8 @@ internal sealed class MainForm : Form
         if (exiting) return;
         e.Cancel = true;
         Hide();
+        previewingRange = false;
+        await seekPump;
         if (player is not null)
         {
             var previous = player;
@@ -621,5 +852,16 @@ internal sealed class MainForm : Form
             else key.DeleteValue("FrameDock", false);
         }
         catch (Exception error) { Error(error); }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            tips.Dispose();
+            coverPreview.Image?.Dispose();
+            tray.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }
