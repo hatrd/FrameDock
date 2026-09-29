@@ -16,7 +16,7 @@ internal sealed record SourceStamp(long Length, long LastWriteTicks)
 }
 
 internal sealed record ExportSpec(MediaInfo Media, double Start, double End, int? AudioIndex,
-    int? SubtitleIndex, bool Copy, bool BurnSubtitle, string OutputPath, double? CopyPacketStart = null,
+    int? SubtitleIndex, bool Copy, bool BurnSubtitle, string OutputPath, Keyframe? CopyKeyframe = null,
     SourceStamp? Source = null);
 
 internal static class OutputNames
@@ -78,6 +78,8 @@ internal static class Exporter
 
     public static async Task<MediaInfo> VerifyAsync(ExportSpec spec, string path, CancellationToken cancellation)
     {
+        spec = await PrepareAsync(spec, cancellation);
+        var sourceStamp = SourceStamp.Capture(spec.Media.Path);
         if (!File.Exists(path) || new FileInfo(path).Length == 0)
             throw new InvalidOperationException("导出文件不存在或为空。");
         var output = await Probe.ReadAsync(path, cancellation);
@@ -93,18 +95,60 @@ internal static class Exporter
             throw new InvalidOperationException("导出音轨与所选音轨不一致。");
         if (output.Subtitles.Count != 0)
             throw new InvalidOperationException("导出文件含有未预期的独立字幕轨。");
-        return output;
+        var timeline = await TimelineVerification.VerifyAsync(spec, output, cancellation);
+        if (SourceStamp.Capture(spec.Media.Path) != sourceStamp)
+            throw new InvalidOperationException("源视频在成品验证期间发生变化，请重新提交。");
+        return output with { Verified = timeline };
+    }
+
+    internal static string SubtitlesPath(string path) => path.Replace('\\', '/')
+        .Replace(":", "\\\\:").Replace("'", "\\\\\\'").Replace(",", "\\,")
+        .Replace(";", "\\;").Replace("[", "\\[").Replace("]", "\\]");
+
+    internal static string SubtitleFilter(ExportSpec spec)
+    {
+        var ordinal = spec.Media.Subtitles.ToList().FindIndex(s => s.Index == spec.SubtitleIndex);
+        if (ordinal < 0) throw new InvalidOperationException("找不到要画入的字幕轨。");
+        return $"subtitles=filename={SubtitlesPath(spec.Media.Path)}:si={ordinal}";
+    }
+
+    private static async Task<ExportSpec> PrepareAsync(ExportSpec spec, CancellationToken cancellation)
+    {
+        cancellation.ThrowIfCancellationRequested();
+        if (spec.Source is not null && SourceStamp.Capture(spec.Media.Path) != spec.Source)
+            throw new InvalidOperationException("源视频在任务排队期间发生变化，已取消导出。请重新提交。");
+        if (!double.IsFinite(spec.Start) || !double.IsFinite(spec.End) || spec.Start < 0 ||
+            spec.End <= spec.Start || spec.End > spec.Media.Duration + 0.001)
+            throw new InvalidOperationException("截取范围无效。");
+        if (spec.Copy && spec.BurnSubtitle) throw new InvalidOperationException("纯复制无法画入字幕。");
+        if (spec.AudioIndex is not null && !spec.Media.Audio.Any(a => a.Index == spec.AudioIndex))
+            throw new InvalidOperationException("找不到所选音轨。");
+        if (spec.Copy)
+        {
+            var key = spec.CopyKeyframe ?? (await Probe.ReadKeyframesAsync(spec.Media.Path, cancellation))
+                .LastOrDefault(k => k.Position <= spec.Start + 0.000001);
+            if (key is null || Math.Abs(key.Position - spec.Start) > 0.000001)
+                throw new InvalidOperationException("纯复制起点不是可验证的关键帧，请重新选择范围。");
+            spec = spec with { CopyKeyframe = key };
+        }
+        return spec;
     }
 
     public static async Task<MediaInfo> RunAsync(ExportSpec spec, CancellationToken cancellation)
     {
-        if (spec.Source is not null && SourceStamp.Capture(spec.Media.Path) != spec.Source)
-            throw new InvalidOperationException("源视频在任务排队期间发生变化，已取消导出。请重新提交。");
+        spec = await PrepareAsync(spec, cancellation);
         var exe = ToolPaths.Find("ffmpeg") ?? throw new InvalidOperationException("找不到 ffmpeg。");
         var extension = Path.GetExtension(spec.OutputPath);
         var temporary = Path.Combine(Path.GetDirectoryName(spec.OutputPath)!,
             "." + Path.GetFileNameWithoutExtension(spec.OutputPath) + ".partial-" + Guid.NewGuid().ToString("N") + extension);
-        if (File.Exists(spec.OutputPath)) return await VerifyAsync(spec, spec.OutputPath, cancellation);
+        if (File.Exists(spec.OutputPath))
+        {
+            try { return await VerifyAsync(spec, spec.OutputPath, cancellation); }
+            catch (InvalidOperationException error)
+            {
+                throw new InvalidOperationException("既有文件未通过验证，已保留原文件。请重新生成：" + error.Message, error);
+            }
+        }
         try
         {
             var start = new ProcessStartInfo(exe) {
@@ -112,33 +156,54 @@ internal static class Exporter
                 RedirectStandardOutput = true
             };
             void Add(params string[] args) { foreach (var arg in args) start.ArgumentList.Add(arg); }
-            var seek = spec.Copy ? spec.CopyPacketStart ?? spec.Start : spec.Start;
-            var coarse = spec.BurnSubtitle ? 0 : Math.Max(0, seek - 5);
+            var packetOffset = spec.Copy && spec.Start > 0 && spec.CopyKeyframe is { } selectedKey
+                // Round outward to FFmpeg's microsecond seek precision, never past the packet DTS.
+                ? Math.Floor((selectedKey.Dts - selectedKey.Pts) * 1_000_000) / 1_000_000 : 0;
+            var coarse = 0d;
             Add("-hide_banner", "-nostdin", "-y", "-v", "warning");
-            if (coarse > 0) Add("-ss", coarse.ToString("F6", CultureInfo.InvariantCulture));
-            Add("-i", spec.Media.Path, "-ss", (seek - coarse).ToString("F6", CultureInfo.InvariantCulture),
-                "-t", (spec.End - seek).ToString("F6", CultureInfo.InvariantCulture), "-map", "0:v:0");
+            if (spec.Copy)
+            {
+                // Input seeking preserves the selected keyframe's negative/reordered DTS.
+                // At the beginning, omit seeking altogether; output -ss 0 can discard the first GOP.
+                if (spec.Start > 0) Add("-ss", MediaProcess.Time(spec.Start));
+                Add("-i", spec.Media.Path);
+                // Some demuxers seek to the previous GOP. Gate on the selected packet's DTS,
+                // then translate back to its PTS origin. This also retains decoding pre-roll.
+                if (spec.Start > 0 && spec.CopyKeyframe is not null)
+                    Add("-ss", MediaProcess.Time(packetOffset));
+            }
+            else
+            {
+                // Keep subtitle evaluation on the source timeline; seek after filtering/decoding.
+                coarse = spec.BurnSubtitle ? 0 : Math.Max(0, spec.Start - 5);
+                if (coarse > 0) Add("-ss", MediaProcess.Time(coarse));
+                Add("-i", spec.Media.Path);
+                if (spec.Start > coarse) Add("-ss", MediaProcess.Time(spec.Start - coarse));
+            }
+            Add("-t", MediaProcess.Time(spec.End - spec.Start - packetOffset), "-map", "0:v:0");
             if (spec.AudioIndex is int audio) Add("-map", $"0:{audio}");
             else Add("-an");
             Add("-sn", "-map_chapters", "-1");
-            if (spec.Copy) Add("-c", "copy");
+            if (spec.Copy)
+            {
+                Add("-c", "copy");
+                if (packetOffset != 0) Add("-output_ts_offset", MediaProcess.Time(packetOffset), "-avoid_negative_ts", "disabled");
+            }
             else
             {
+                var filters = new List<string>();
                 if (spec.BurnSubtitle)
                 {
-                    var ordinal = spec.Media.Subtitles.ToList().FindIndex(s => s.Index == spec.SubtitleIndex);
-                    if (ordinal < 0) throw new InvalidOperationException("找不到要画入的字幕轨。");
-                    var path = spec.Media.Path.Replace('\\', '/')
-                        .Replace(":", "\\\\:")
-                        .Replace("'", "\\\\\\'")
-                        .Replace(",", "\\,")
-                        .Replace(";", "\\;")
-                        .Replace("[", "\\[")
-                        .Replace("]", "\\]");
-                    Add("-vf", $"subtitles=filename={path}:si={ordinal}");
+                    if (spec.Media.TimelineOrigin != 0) filters.Add($"setpts=PTS+{MediaProcess.Time(spec.Media.TimelineOrigin)}/TB");
+                    filters.Add(SubtitleFilter(spec));
+                    if (spec.Media.TimelineOrigin != 0) filters.Add($"setpts=PTS-{MediaProcess.Time(spec.Media.TimelineOrigin)}/TB");
                 }
+                filters.Add("settb=AVTB");
+                filters.Add($"trim=start={MediaProcess.Time(spec.Start - coarse)}:end={MediaProcess.Time(spec.End - coarse)}");
+                Add("-vf", string.Join(',', filters));
                 var codec = spec.Media.VideoCodec == "hevc" ? "libx265" : "libx264";
                 Add("-c:v", codec, "-preset", "fast", "-crf", codec == "libx265" ? "20" : "18");
+                Add("-fps_mode", "passthrough", "-enc_time_base:v", "filter");
                 if (spec.AudioIndex is not null) Add("-c:a", "copy");
             }
             Add(temporary);

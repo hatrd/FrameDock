@@ -248,7 +248,7 @@ internal sealed class MainForm : Form
                 if (!IsHandleCreated || IsDisposed) return;
                 BeginInvoke(() => { lastPosition = position; range.Position = position; UpdatePosition(); });
             };
-            await player.LoadAsync(path);
+            await player.LoadAsync(path, media!.TimelineOrigin);
             await WaitForTracksAsync();
             await player.SetTrackAsync("aid", (audio.SelectedItem as TrackOption)?.Index);
             await player.SetTrackAsync("sid", (subtitle.SelectedItem as TrackOption)?.Index);
@@ -303,8 +303,8 @@ internal sealed class MainForm : Form
     private double ActualStart()
     {
         if (!copy.Checked || keyframes is not { Count: > 0 }) return range.Start;
-        var index = keyframes.FindLastIndex(frame => frame.Pts <= range.Start + 0.0005);
-        return index < 0 ? 0 : keyframes[index].Pts;
+        var index = keyframes.FindLastIndex(frame => frame.Position <= range.Start + 0.0005);
+        return index < 0 ? Math.Max(0, keyframes[0].Position) : Math.Max(0, keyframes[index].Position);
     }
 
     private void UpdateRange()
@@ -431,9 +431,9 @@ internal sealed class MainForm : Form
                 if (proceed != DialogResult.Yes) return;
             }
             var output = OutputNames.Clip(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, extension);
-            var copySeek = doCopy ? Math.Max(0, (keyframes?.FindLast(frame => frame.Pts <= start + 0.0005)?.Dts ?? start) - 0.005) : (double?)null;
+            var copyKeyframe = doCopy ? keyframes?.FindLast(frame => frame.Position <= start + 0.0005) : null;
             var spec = new ExportSpec(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, output,
-                copySeek, SourceStamp.Capture(media.Path));
+                copyKeyframe, SourceStamp.Capture(media.Path));
             if (File.Exists(output))
             {
                 try
@@ -444,7 +444,8 @@ internal sealed class MainForm : Form
                 }
                 catch (Exception error) when (error is InvalidOperationException or FormatException)
                 {
-                    ArchiveInvalid(output);
+                    var archived = ArchiveInvalid(output);
+                    SetStatus("既有片段验证失败，原文件保留在 " + archived + "；正在重新生成。");
                 }
             }
             if (activePaths.Contains(output)) { SetStatus("任务已在排队或运行：" + output); return; }
@@ -457,10 +458,11 @@ internal sealed class MainForm : Form
         catch (Exception error) { Error(error); }
     }
 
-    private static void ArchiveInvalid(string path)
+    private static string ArchiveInvalid(string path)
     {
         var archived = path + ".invalid-" + Guid.NewGuid().ToString("N");
         File.Move(path, archived);
+        return archived;
     }
 
     private void PumpQueue()
@@ -502,7 +504,9 @@ internal sealed class MainForm : Form
         {
             var output = await Exporter.RunAsync(job.Spec, job.Cancellation.Token);
             UpdateJob(job, "完成");
-            SetStatus($"片段已保存（实际时长 {output.Duration:F3} 秒）：{job.Spec.OutputPath}");
+            var timeline = output.Verified!;
+            SetStatus($"片段已保存（核实源视频首帧 {Clock(timeline.FirstVideoSourcePosition)}，末帧 {Clock(timeline.LastVideoSourcePosition)}，" +
+                $"成品时长 {output.Duration:F3} 秒）：{job.Spec.OutputPath}");
         }
         catch (OperationCanceledException) { UpdateJob(job, "取消"); }
         catch (Exception error) { job.Failure = error.Message; UpdateJob(job, "失败"); SetStatus(error.Message); }

@@ -6,8 +6,14 @@ namespace FrameDock;
 
 internal sealed record MediaTrack(int Index, string Codec, string Label, bool IsDefault);
 internal sealed record MediaInfo(string Path, double Duration, string VideoCodec,
-    IReadOnlyList<MediaTrack> Audio, IReadOnlyList<MediaTrack> Subtitles);
-internal sealed record Keyframe(double Pts, double Dts);
+    IReadOnlyList<MediaTrack> Audio, IReadOnlyList<MediaTrack> Subtitles,
+    double TimelineOrigin = 0, string VideoTimeBase = "1/1000", VerifiedTimeline? Verified = null);
+// Pts/Dts are original source timestamps. Position is relative to the player's origin.
+internal sealed record Keyframe(double Pts, double Dts, double TimelineOrigin = 0,
+    long? RawPts = null, long? RawDts = null, string TimeBase = "1/1000")
+{
+    public double Position => Pts - TimelineOrigin;
+}
 
 internal static class ToolPaths
 {
@@ -74,6 +80,7 @@ internal static class Probe
 {
     public static async Task<MediaInfo> ReadAsync(string path, CancellationToken cancellation = default)
     {
+        cancellation.ThrowIfCancellationRequested();
         var exe = ToolPaths.Find("ffprobe") ?? throw new InvalidOperationException("找不到 ffprobe。");
         using var process = new Process { StartInfo = new ProcessStartInfo(exe) {
             UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
@@ -81,6 +88,7 @@ internal static class Probe
         foreach (var arg in new[] { "-v", "error", "-show_format", "-show_streams", "-of", "json", path })
             process.StartInfo.ArgumentList.Add(arg);
         process.Start();
+        using var registration = MediaProcess.CancelWith(process, cancellation);
         var output = process.StandardOutput.ReadToEndAsync(cancellation);
         var error = process.StandardError.ReadToEndAsync(cancellation);
         await process.WaitForExitAsync(cancellation);
@@ -88,6 +96,13 @@ internal static class Probe
         using var json = JsonDocument.Parse(await output);
         var root = json.RootElement;
         var duration = double.Parse(root.GetProperty("format").GetProperty("duration").GetString()!, CultureInfo.InvariantCulture);
+        var origin = root.GetProperty("format").TryGetProperty("start_time", out var originValue) &&
+            double.TryParse(originValue.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedOrigin)
+            ? parsedOrigin : 0;
+        // Matroska's segment duration is measured from timestamp zero, even with a nonzero first cluster.
+        var formatName = root.GetProperty("format").GetProperty("format_name").GetString() ?? "";
+        if (formatName.Contains("matroska") || formatName.Contains("webm")) duration -= origin;
+        var timeBase = "1/1000";
         var audio = new List<MediaTrack>();
         var subtitles = new List<MediaTrack>();
         string? codec = null;
@@ -95,7 +110,12 @@ internal static class Probe
         {
             var kind = stream.GetProperty("codec_type").GetString();
             var currentCodec = stream.TryGetProperty("codec_name", out var c) ? c.GetString() ?? "unknown" : "unknown";
-            if (kind == "video" && codec is null) { codec = currentCodec; continue; }
+            if (kind == "video" && codec is null)
+            {
+                codec = currentCodec;
+                timeBase = stream.GetProperty("time_base").GetString()!;
+                continue;
+            }
             if (kind is not ("audio" or "subtitle")) continue;
             var index = stream.GetProperty("index").GetInt32();
             var isDefault = stream.TryGetProperty("disposition", out var disposition) &&
@@ -109,36 +129,30 @@ internal static class Probe
             (kind == "audio" ? audio : subtitles).Add(track);
         }
         if (codec is null) throw new InvalidOperationException("文件没有可播放的视频轨。");
-        return new MediaInfo(path, duration, codec, audio, subtitles);
+        return new MediaInfo(path, duration, codec, audio, subtitles, origin, timeBase);
     }
 
     public static async Task<List<Keyframe>> ReadKeyframesAsync(string path, CancellationToken cancellation)
     {
-        var exe = ToolPaths.Find("ffprobe") ?? throw new InvalidOperationException("找不到 ffprobe。");
-        using var process = new Process { StartInfo = new ProcessStartInfo(exe) {
-            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
-        } };
-        foreach (var arg in new[] { "-v", "error", "-select_streams", "v:0", "-show_packets",
-                     "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", path })
-            process.StartInfo.ArgumentList.Add(arg);
-        process.Start();
-        var errors = process.StandardError.ReadToEndAsync(cancellation);
+        var media = await ReadAsync(path, cancellation);
         var keyframes = new List<Keyframe>();
-        while (await process.StandardOutput.ReadLineAsync(cancellation) is { } line)
+        await MediaProcess.ProbeLinesAsync(path, "v:0", "-show_packets",
+            "packet=pts,dts,pts_time,dts_time,flags", null, fields =>
         {
-            var parts = line.Split(',', 3);
-            if (parts.Length == 3 && parts[2].Contains('K') &&
-                double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var time))
+            if (fields.GetValueOrDefault("flags", "").Contains('K') &&
+                MediaProcess.Number(fields, "pts_time") is double pts)
             {
-                var dts = double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
-                    ? parsed : time;
-                keyframes.Add(new Keyframe(Math.Max(0, time), Math.Max(0, dts)));
+                var rawPts = MediaProcess.Integer(fields, "pts");
+                var rawDts = MediaProcess.Integer(fields, "dts");
+                var parts = media.VideoTimeBase.Split('/');
+                var tick = double.Parse(parts[0], CultureInfo.InvariantCulture) / double.Parse(parts[1], CultureInfo.InvariantCulture);
+                keyframes.Add(new Keyframe(rawPts is long p ? p * tick : pts,
+                    rawDts is long d ? d * tick : MediaProcess.Number(fields, "dts_time") ?? pts,
+                    media.TimelineOrigin, rawPts, rawDts, media.VideoTimeBase));
             }
-        }
-        await process.WaitForExitAsync(cancellation);
-        if (process.ExitCode != 0) throw new InvalidOperationException($"读取关键帧失败：{await errors}");
+        }, cancellation);
         keyframes.Sort((a, b) => a.Pts.CompareTo(b.Pts));
-        if (keyframes.Count == 0) keyframes.Add(new Keyframe(0, 0));
+        if (keyframes.Count == 0) throw new InvalidOperationException("找不到可验证的关键帧，请使用精确模式。");
         return keyframes;
     }
 }
