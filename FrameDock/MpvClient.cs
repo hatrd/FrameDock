@@ -24,6 +24,7 @@ internal sealed class MpvClient : IAsyncDisposable
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> requests = new();
     private readonly CancellationTokenSource lifetime = new();
     private int nextRequest;
+    private double timelineOrigin;
 
     public event Action<double>? PositionChanged;
     public event Action<bool>? PauseChanged;
@@ -37,16 +38,22 @@ internal sealed class MpvClient : IAsyncDisposable
         _ = ReadLoopAsync();
     }
 
-    public static async Task<MpvClient> StartAsync(IntPtr hostWindow)
+    public static async Task<MpvClient> StartAsync(IntPtr hostWindow, bool headless = false)
     {
         var exe = ToolPaths.Find("mpv") ?? throw new InvalidOperationException("找不到 mpv.exe，请使用发布包或设置 FRAMEDOCK_MPV。");
         var pipeName = "framedock-" + Guid.NewGuid().ToString("N");
         var start = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true };
         foreach (var arg in new[] { "--no-config", "--no-osc", "--no-input-default-bindings", "--input-vo-keyboard=no",
-                     "--idle=yes", "--pause=yes", "--force-window=yes", "--keep-open=yes", "--terminal=no", "--sub-auto=no",
+                     "--idle=yes", "--pause=yes", "--force-window=" + (headless ? "no" : "yes"),
+                     "--rebase-start-time=no", "--keep-open=yes", "--terminal=no", "--sub-auto=no",
                      "--wid=" + unchecked((uint)hostWindow.ToInt64()).ToString(CultureInfo.InvariantCulture),
                      "--input-ipc-server=" + pipeName })
             start.ArgumentList.Add(arg);
+        if (headless)
+        {
+            start.ArgumentList.Add("--vo=null");
+            start.ArgumentList.Add("--ao=null");
+        }
         var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 mpv。");
         var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         try
@@ -88,7 +95,7 @@ internal sealed class MpvClient : IAsyncDisposable
                     root.TryGetProperty("name", out var name) && root.TryGetProperty("data", out var value))
                 {
                     if (name.GetString() == "time-pos" && value.ValueKind == JsonValueKind.Number)
-                        PositionChanged?.Invoke(value.GetDouble());
+                        PositionChanged?.Invoke(value.GetDouble() - timelineOrigin);
                     if (name.GetString() == "pause" && value.ValueKind is JsonValueKind.True or JsonValueKind.False)
                         PauseChanged?.Invoke(value.GetBoolean());
                 }
@@ -118,13 +125,22 @@ internal sealed class MpvClient : IAsyncDisposable
         return reply.TryGetProperty("data", out var data) ? data.Clone() : default;
     }
 
-    public Task LoadAsync(string path) => RestartPlaybackAsync("loadfile", path, "replace");
+    public Task LoadAsync(string path, double origin = 0)
+    {
+        timelineOrigin = origin;
+        return RestartPlaybackAsync("loadfile", path, "replace");
+    }
     public Task PauseAsync(bool pause) => CommandAsync("set_property", "pause", pause);
-    public Task SeekAsync(double seconds) => RestartPlaybackAsync("seek", seconds, "absolute+exact");
+    public Task SeekAsync(double seconds) => RestartPlaybackAsync("seek", seconds + timelineOrigin, "absolute+exact");
     public Task JumpAsync(double seconds) => RestartPlaybackAsync("seek", seconds, "relative+exact");
     public Task StepAsync(bool backward) => CommandAsync(backward ? "frame-back-step" : "frame-step");
     public Task StopAsync() => CommandAsync("stop");
-    public Task<JsonElement> PropertyAsync(string name) => CommandAsync("get_property", name);
+    public async Task<JsonElement> PropertyAsync(string name)
+    {
+        var value = await CommandAsync("get_property", name);
+        return name == "time-pos" && value.ValueKind == JsonValueKind.Number
+            ? JsonSerializer.SerializeToElement(value.GetDouble() - timelineOrigin) : value;
+    }
 
     private async Task RestartPlaybackAsync(params object?[] command)
     {
