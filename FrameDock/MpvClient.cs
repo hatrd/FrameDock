@@ -19,6 +19,7 @@ internal sealed class MpvClient : IAsyncDisposable
     {
         public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Started { get; set; }
+        public double? PreviousPosition { get; init; }
     }
     private volatile SeekOperation? seekOperation;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> requests = new();
@@ -85,7 +86,9 @@ internal sealed class MpvClient : IAsyncDisposable
                 {
                     var eventName = playbackEvent.GetString();
                     if (eventName is "seek" or "file-loaded") operation.Started = true;
-                    if (eventName == "playback-restart" && operation.Started || eventName == "end-file")
+                    if (eventName == "end-file" && root.TryGetProperty("reason", out var reason) && reason.GetString() == "error")
+                        operation.Completion.TrySetException(new InvalidOperationException("mpv 无法读取视频。"));
+                    if (operation.Started && eventName is "playback-restart" or "end-file")
                         operation.Completion.TrySetResult();
                 }
                 if (root.TryGetProperty("request_id", out var id) && id.TryGetInt32(out var requestId) &&
@@ -95,7 +98,11 @@ internal sealed class MpvClient : IAsyncDisposable
                     root.TryGetProperty("name", out var name) && root.TryGetProperty("data", out var value))
                 {
                     if (name.GetString() == "time-pos" && value.ValueKind == JsonValueKind.Number)
+                    {
+                        if (seekOperation is { PreviousPosition: double previous } step && Math.Abs(value.GetDouble() - previous) > 0.000001)
+                            step.Completion.TrySetResult();
                         PositionChanged?.Invoke(value.GetDouble() - timelineOrigin);
+                    }
                     if (name.GetString() == "pause" && value.ValueKind is JsonValueKind.True or JsonValueKind.False)
                         PauseChanged?.Invoke(value.GetBoolean());
                 }
@@ -125,15 +132,35 @@ internal sealed class MpvClient : IAsyncDisposable
         return reply.TryGetProperty("data", out var data) ? data.Clone() : default;
     }
 
-    public Task LoadAsync(string path, double origin = 0)
+    public async Task LoadAsync(string path, double origin = 0)
     {
         timelineOrigin = origin;
-        return RestartPlaybackAsync("loadfile", path, "replace");
+        await RestartPlaybackAsync("loadfile", path, "replace");
+        PositionChanged?.Invoke((await PropertyAsync("time-pos")).GetDouble());
     }
     public Task PauseAsync(bool pause) => CommandAsync("set_property", "pause", pause);
     public Task SeekAsync(double seconds) => RestartPlaybackAsync("seek", seconds + timelineOrigin, "absolute+exact");
     public Task JumpAsync(double seconds) => RestartPlaybackAsync("seek", seconds, "relative+exact");
-    public Task StepAsync(bool backward) => CommandAsync(backward ? "frame-back-step" : "frame-step");
+    public async Task StepAsync(bool backward)
+    {
+        if (backward)
+        {
+            if ((await PropertyAsync("time-pos")).GetDouble() <= 0.000001) return;
+            await RestartPlaybackAsync("frame-back-step");
+            return;
+        }
+        await seekLock.WaitAsync(lifetime.Token);
+        try
+        {
+            if ((await PropertyAsync("eof-reached")).GetBoolean()) return;
+            var previous = (await CommandAsync("get_property", "time-pos")).GetDouble();
+            var operation = new SeekOperation { PreviousPosition = previous };
+            seekOperation = operation;
+            await CommandAsync("frame-step");
+            await operation.Completion.Task.WaitAsync(TimeSpan.FromSeconds(15), lifetime.Token);
+        }
+        finally { seekOperation = null; seekLock.Release(); }
+    }
     public Task StopAsync() => CommandAsync("stop");
     public async Task<JsonElement> PropertyAsync(string name)
     {

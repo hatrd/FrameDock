@@ -152,11 +152,12 @@ internal static class Program
         Check(File.Exists(coverPath) && SHA256.HashData(File.ReadAllBytes(coverPath)).SequenceEqual(SHA256.HashData(png)), "S exports frozen full-resolution cover");
         copy.Checked = false;
         await CallAsync(form, "SubmitExportAsync", true);
+        await CallAsync(form, "SelectCoverAsync");
         await WaitUntilAsync(() => Field<ListBox>(form, "jobs").Items.Cast<object>().Any(j => j.ToString()!.StartsWith("完成")), 15000);
         var spec = (ExportSpec)Field<ListBox>(form, "jobs").Items[0].GetType().GetProperty("Spec")!.GetValue(Field<ListBox>(form, "jobs").Items[0])!;
         var bundled = OutputNames.ClipCover(spec.OutputPath, media, coverPosition, null);
         var output = await Probe.ReadAsync(spec.OutputPath);
-        Check(File.Exists(bundled) && SHA256.HashData(File.ReadAllBytes(bundled)).SequenceEqual(SHA256.HashData(png)), "Shift+D exports the selected cover alongside clip");
+        Check(File.Exists(bundled) && SHA256.HashData(File.ReadAllBytes(bundled)).SequenceEqual(SHA256.HashData(png)), "Shift+D exports submission-time cover even when selection changes during export");
         Check(Near(output.Duration, 5.5, 0.15), "trimmed output duration matches selection");
         await CallAsync(form, "ScreenshotAsync", true);
         var currentPosition = (await player.PropertyAsync("time-pos")).GetDouble();
@@ -165,6 +166,10 @@ internal static class Program
         var seeks = new[] { CallAsync(form, "SeekAsync", 30d), CallAsync(form, "SeekAsync", 45d), CallAsync(form, "SeekAsync", 60d) };
         await Task.WhenAll(seeks);
         Check(Near((await player.PropertyAsync("time-pos")).GetDouble(), 60, 0.04), "rapid seeks settle on the final requested position");
+        await CallAsync(form, "HandleShortcutAsync", Keys.Right, false);
+        Check(Near((await player.PropertyAsync("time-pos")).GetDouble(), 60 + 1d / 30, 0.005), "right shortcut settles on the next actual frame");
+        await CallAsync(form, "HandleShortcutAsync", Keys.Left, false);
+        Check(Near((await player.PropertyAsync("time-pos")).GetDouble(), 60, 0.005), "left shortcut settles on the previous actual frame");
         bar.End = 60.4;
         bar.Start = 60;
         await CallAsync(form, "PreviewRangeAsync");

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Win32;
 
@@ -118,7 +119,11 @@ internal sealed class MainForm : Form
         var open = Button("打开视频", async () => await PickVideoAsync());
         var play = Button("播放/暂停", async () => await TogglePauseAsync());
         var export = Button("D 导出片段", async () => await SubmitExportAsync());
-        controls.Controls.AddRange([open, play, export, copy]);
+        var outputFolder = Button("打开输出目录", () => {
+            if (media is not null) Process.Start(new ProcessStartInfo(Path.GetDirectoryName(media.Path)!) { UseShellExecute = true });
+            return Task.CompletedTask;
+        });
+        controls.Controls.AddRange([open, play, export, copy, outputFolder]);
         root.Controls.Add(controls, 0, 4);
         tips.SetToolTip(copy, "纯复制会从所选起点之前的关键帧开始，可能多留一小段头部。需要准确去头时取消勾选。");
 

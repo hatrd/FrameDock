@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 
 namespace FrameDock;
 
@@ -240,4 +240,3 @@ internal sealed class RangeBar : Control
         base.Dispose(disposing);
     }
 }
-
