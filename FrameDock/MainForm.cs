@@ -10,7 +10,15 @@ internal sealed class MainForm : Form
     {
         public override string ToString() => Label;
     }
-    private sealed record Job(ExportSpec Spec, CancellationTokenSource Cancellation);
+    private sealed class Job(ExportSpec spec)
+    {
+        public ExportSpec Spec { get; } = spec;
+        public CancellationTokenSource Cancellation { get; } = new();
+        public string State { get; set; } = "排队";
+        public string? Failure { get; set; }
+        public override string ToString() => $"{State}  {Path.GetFileName(Spec.OutputPath)}" +
+            (Failure is null ? "" : " — " + Failure);
+    }
 
     private readonly Panel video = new() { Dock = DockStyle.Fill, BackColor = Color.Black, AllowDrop = true };
     private readonly RangeBar range = new() { Dock = DockStyle.Fill };
@@ -155,8 +163,17 @@ internal sealed class MainForm : Form
 
     private async Task InitializeAsync()
     {
-        try { await ToolPaths.EnsureFfmpegAsync(); }
-        catch (Exception error) { Error(error); }
+        while (true)
+        {
+            try { await ToolPaths.EnsureFfmpegAsync(); return; }
+            catch (Exception error)
+            {
+                SetStatus(error.Message);
+                var choice = MessageBox.Show(this, error.Message + "\n\n重试安装或检测 FFmpeg？", "FrameDock",
+                    MessageBoxButtons.RetryCancel, MessageBoxIcon.Error);
+                if (choice != DialogResult.Retry) return;
+            }
+        }
     }
 
     private void OnDragEnter(object? sender, DragEventArgs e)
@@ -197,16 +214,7 @@ internal sealed class MainForm : Form
             subtitle.Items.Add(new TrackOption(null, "关闭字幕"));
             foreach (var track in info.Subtitles) subtitle.Items.Add(new TrackOption(track.Index, track.Label));
             subtitle.SelectedIndex = 0;
-            player = await MpvClient.StartAsync(video.Handle);
-            player.PositionChanged += position => {
-                if (!IsHandleCreated || IsDisposed) return;
-                BeginInvoke(() => { lastPosition = position; range.Position = position; UpdatePosition(); });
-            };
-            await player.LoadAsync(path);
-            await WaitForTracksAsync();
-            loading = false;
-            await SelectTrackAsync("aid", audio);
-            await SelectTrackAsync("sid", subtitle);
+            await AttachPlayerAsync(path, 0);
             SetStatus($"已打开 {Path.GetFileName(path)}；正在分析可复制切点…");
             var scan = keyframeScan = new CancellationTokenSource();
             _ = ScanKeyframesAsync(info, scan.Token);
@@ -229,6 +237,31 @@ internal sealed class MainForm : Form
             await Task.Delay(100);
         }
         throw new InvalidOperationException("视频预览加载超时。");
+    }
+
+    private async Task AttachPlayerAsync(string path, double restorePosition)
+    {
+        player = await MpvClient.StartAsync(video.Handle);
+        try
+        {
+            player.PositionChanged += position => {
+                if (!IsHandleCreated || IsDisposed) return;
+                BeginInvoke(() => { lastPosition = position; range.Position = position; UpdatePosition(); });
+            };
+            await player.LoadAsync(path);
+            await WaitForTracksAsync();
+            await player.SetTrackAsync("aid", (audio.SelectedItem as TrackOption)?.Index);
+            await player.SetTrackAsync("sid", (subtitle.SelectedItem as TrackOption)?.Index);
+            await player.CommandAsync("set_property", "video-zoom", -previewScale.SelectedIndex);
+            if (restorePosition > 0) await player.SeekAsync(restorePosition);
+            await player.PauseAsync(true);
+        }
+        catch
+        {
+            await player.DisposeAsync();
+            player = null;
+            throw;
+        }
     }
 
     private async Task ScanKeyframesAsync(MediaInfo target, CancellationToken cancellation)
@@ -333,11 +366,24 @@ internal sealed class MainForm : Form
             var position = (await player.PropertyAsync("time-pos")).GetDouble();
             var sub = (subtitle.SelectedItem as TrackOption)?.Index;
             var path = OutputNames.Screenshot(media, position, sub);
-            if (File.Exists(path)) SetStatus("截图已存在：" + path);
-            else
+            if (File.Exists(path))
+            {
+                try
+                {
+                    using var existing = Image.FromFile(path);
+                    if (existing.Width <= 0 || existing.Height <= 0) throw new InvalidOperationException("图片尺寸无效。");
+                    SetStatus("截图已存在：" + path);
+                }
+                catch (Exception error) when (error is ArgumentException or OutOfMemoryException or InvalidOperationException)
+                {
+                    ArchiveInvalid(path);
+                }
+            }
+            if (!File.Exists(path))
             {
                 await player.ScreenshotAsync(path, sub is not null);
-                if (!File.Exists(path)) throw new InvalidOperationException("截图没有写入文件。");
+                using var saved = Image.FromFile(path);
+                if (saved.Width <= 0 || saved.Height <= 0) throw new InvalidOperationException("截图尺寸无效。");
                 SetStatus("截图已保存：" + path);
             }
             if (!paused) await player.PauseAsync(false);
@@ -368,6 +414,13 @@ internal sealed class MainForm : Form
                 doCopy = choice == DialogResult.No;
                 burn = choice == DialogResult.Yes;
             }
+            if (!doCopy && media.VideoCodec is not ("h264" or "hevc"))
+            {
+                var proceed = MessageBox.Show(this,
+                    $"源视频编码为 {media.VideoCodec}。精确模式将输出 H.264 视频，所选音轨尽量原样复制。继续？",
+                    "视频编码", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (proceed != DialogResult.Yes) return;
+            }
             var start = doCopy ? ActualStart() : range.Start;
             if (range.End - start < 0.001) throw new InvalidOperationException("截取范围太短。");
             var extension = Exporter.ExtensionFor(media, audioTrack);
@@ -378,18 +431,36 @@ internal sealed class MainForm : Form
                 if (proceed != DialogResult.Yes) return;
             }
             var output = OutputNames.Clip(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, extension);
-            if (File.Exists(output)) { SetStatus("片段已完成：" + output); return; }
-            if (activePaths.Contains(output)) { SetStatus("任务已在排队或运行：" + output); return; }
             var copySeek = doCopy ? Math.Max(0, (keyframes?.FindLast(frame => frame.Pts <= start + 0.0005)?.Dts ?? start) - 0.005) : (double?)null;
-            var spec = new ExportSpec(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, output, copySeek);
-            var job = new Job(spec, new CancellationTokenSource());
+            var spec = new ExportSpec(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, output,
+                copySeek, SourceStamp.Capture(media.Path));
+            if (File.Exists(output))
+            {
+                try
+                {
+                    await Exporter.VerifyAsync(spec, output, CancellationToken.None);
+                    SetStatus("片段已完成：" + output);
+                    return;
+                }
+                catch (Exception error) when (error is InvalidOperationException or FormatException)
+                {
+                    ArchiveInvalid(output);
+                }
+            }
+            if (activePaths.Contains(output)) { SetStatus("任务已在排队或运行：" + output); return; }
+            var job = new Job(spec);
             waiting.Enqueue(job);
             activePaths.Add(output);
-            jobs.Items.Add("排队  " + Path.GetFileName(output));
+            jobs.Items.Add(job);
             PumpQueue();
         }
         catch (Exception error) { Error(error); }
-        await Task.CompletedTask;
+    }
+
+    private static void ArchiveInvalid(string path)
+    {
+        var archived = path + ".invalid-" + Guid.NewGuid().ToString("N");
+        File.Move(path, archived);
     }
 
     private void PumpQueue()
@@ -399,42 +470,42 @@ internal sealed class MainForm : Form
             var job = waiting.Dequeue();
             if (job.Cancellation.IsCancellationRequested)
             {
-                jobs.Items.Add("取消  " + Path.GetFileName(job.Spec.OutputPath));
+                UpdateJob(job, "取消");
                 activePaths.Remove(job.Spec.OutputPath);
                 job.Cancellation.Dispose();
                 continue;
             }
             runningJobs.Add(job);
-            jobs.Items.Add("运行  " + Path.GetFileName(job.Spec.OutputPath));
+            UpdateJob(job, "运行");
             _ = RunJobAsync(job);
         }
     }
 
+    private void UpdateJob(Job job, string state)
+    {
+        job.State = state;
+        var index = jobs.Items.IndexOf(job);
+        if (index >= 0) jobs.Items[index] = job;
+    }
+
     private void CancelSelectedJob()
     {
-        if (jobs.SelectedItem is not string selected) return;
-        var name = selected.StartsWith("排队  ", StringComparison.Ordinal) ? selected[4..] :
-            selected.StartsWith("运行  ", StringComparison.Ordinal) ? selected[4..] : null;
-        if (name is null) return;
-        var job = runningJobs.Concat(waiting).FirstOrDefault(item =>
-            string.Equals(Path.GetFileName(item.Spec.OutputPath), name, StringComparison.OrdinalIgnoreCase));
-        if (job is null) return;
+        if (jobs.SelectedItem is not Job job || job.State is not ("排队" or "运行")) return;
         job.Cancellation.Cancel();
-        SetStatus("已请求取消：" + name);
+        SetStatus("已请求取消：" + Path.GetFileName(job.Spec.OutputPath));
         PumpQueue();
     }
 
     private async Task RunJobAsync(Job job)
     {
-        var name = Path.GetFileName(job.Spec.OutputPath);
         try
         {
             var output = await Exporter.RunAsync(job.Spec, job.Cancellation.Token);
-            jobs.Items.Add("完成  " + name);
+            UpdateJob(job, "完成");
             SetStatus($"片段已保存（实际时长 {output.Duration:F3} 秒）：{job.Spec.OutputPath}");
         }
-        catch (OperationCanceledException) { jobs.Items.Add("取消  " + name); }
-        catch (Exception error) { jobs.Items.Add("失败  " + name + " — " + error.Message); SetStatus(error.Message); }
+        catch (OperationCanceledException) { UpdateJob(job, "取消"); }
+        catch (Exception error) { job.Failure = error.Message; UpdateJob(job, "失败"); SetStatus(error.Message); }
         finally
         {
             job.Cancellation.Dispose();
@@ -459,17 +530,7 @@ internal sealed class MainForm : Form
         if (media is null || player is not null) return;
         try
         {
-            player = await MpvClient.StartAsync(video.Handle);
-            player.PositionChanged += position => {
-                if (!IsHandleCreated || IsDisposed) return;
-                BeginInvoke(() => { lastPosition = position; range.Position = position; UpdatePosition(); });
-            };
-            await player.LoadAsync(media.Path);
-            await WaitForTracksAsync();
-            await SelectTrackAsync("aid", audio);
-            await SelectTrackAsync("sid", subtitle);
-            await player.SeekAsync(lastPosition);
-            await player.PauseAsync(true);
+            await AttachPlayerAsync(media.Path, lastPosition);
         }
         catch (Exception error) { Error(error); }
     }

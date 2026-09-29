@@ -5,8 +5,19 @@ using System.Text;
 
 namespace FrameDock;
 
+internal sealed record SourceStamp(long Length, long LastWriteTicks)
+{
+    public static SourceStamp Capture(string path)
+    {
+        var file = new FileInfo(path);
+        if (!file.Exists) throw new FileNotFoundException("源视频不存在。", path);
+        return new SourceStamp(file.Length, file.LastWriteTimeUtc.Ticks);
+    }
+}
+
 internal sealed record ExportSpec(MediaInfo Media, double Start, double End, int? AudioIndex,
-    int? SubtitleIndex, bool Copy, bool BurnSubtitle, string OutputPath, double? CopyPacketStart = null);
+    int? SubtitleIndex, bool Copy, bool BurnSubtitle, string OutputPath, double? CopyPacketStart = null,
+    SourceStamp? Source = null);
 
 internal static class OutputNames
 {
@@ -31,8 +42,8 @@ internal static class OutputNames
 
     private static string SourceState(string source)
     {
-        var info = new FileInfo(source);
-        return $"{Path.GetFullPath(source)}|{info.Length}|{info.LastWriteTimeUtc.Ticks}";
+        var stamp = SourceStamp.Capture(source);
+        return $"{Path.GetFullPath(source)}|{stamp.Length}|{stamp.LastWriteTicks}";
     }
 
     public static string Screenshot(MediaInfo media, double position, int? subtitleIndex)
@@ -65,13 +76,35 @@ internal static class Exporter
         return codec is null or "aac" or "mp3" or "alac" or "ac3" or "eac3" ? ".mp4" : ".mkv";
     }
 
+    public static async Task<MediaInfo> VerifyAsync(ExportSpec spec, string path, CancellationToken cancellation)
+    {
+        if (!File.Exists(path) || new FileInfo(path).Length == 0)
+            throw new InvalidOperationException("导出文件不存在或为空。");
+        var output = await Probe.ReadAsync(path, cancellation);
+        var desiredDuration = spec.End - spec.Start;
+        var tolerance = spec.Copy ? Math.Max(0.5, Math.Min(2, desiredDuration * 0.02)) : 0.3;
+        if (output.Duration <= 0 || Math.Abs(output.Duration - desiredDuration) > tolerance)
+            throw new InvalidOperationException($"导出时长异常：预计 {desiredDuration:F3} 秒，实际 {output.Duration:F3} 秒。");
+        var expectedVideo = spec.Copy ? spec.Media.VideoCodec : spec.Media.VideoCodec == "hevc" ? "hevc" : "h264";
+        if (output.VideoCodec != expectedVideo)
+            throw new InvalidOperationException($"导出视频编码异常：{output.VideoCodec}。");
+        var expectedAudio = spec.Media.Audio.FirstOrDefault(a => a.Index == spec.AudioIndex)?.Codec;
+        if (expectedAudio is null ? output.Audio.Count != 0 : output.Audio.Count != 1 || output.Audio[0].Codec != expectedAudio)
+            throw new InvalidOperationException("导出音轨与所选音轨不一致。");
+        if (output.Subtitles.Count != 0)
+            throw new InvalidOperationException("导出文件含有未预期的独立字幕轨。");
+        return output;
+    }
+
     public static async Task<MediaInfo> RunAsync(ExportSpec spec, CancellationToken cancellation)
     {
+        if (spec.Source is not null && SourceStamp.Capture(spec.Media.Path) != spec.Source)
+            throw new InvalidOperationException("源视频在任务排队期间发生变化，已取消导出。请重新提交。");
         var exe = ToolPaths.Find("ffmpeg") ?? throw new InvalidOperationException("找不到 ffmpeg。");
         var extension = Path.GetExtension(spec.OutputPath);
         var temporary = Path.Combine(Path.GetDirectoryName(spec.OutputPath)!,
             "." + Path.GetFileNameWithoutExtension(spec.OutputPath) + ".partial-" + Guid.NewGuid().ToString("N") + extension);
-        if (File.Exists(spec.OutputPath)) return await Probe.ReadAsync(spec.OutputPath, cancellation);
+        if (File.Exists(spec.OutputPath)) return await VerifyAsync(spec, spec.OutputPath, cancellation);
         try
         {
             var start = new ProcessStartInfo(exe) {
@@ -123,21 +156,9 @@ internal static class Exporter
                 throw new InvalidOperationException("FFmpeg 导出失败：" + error[^Math.Min(error.Length, 1600)..]);
             }
             await stdout;
-            if (!File.Exists(temporary) || new FileInfo(temporary).Length == 0)
-                throw new InvalidOperationException("FFmpeg 未生成有效视频。");
-            var output = await Probe.ReadAsync(temporary, cancellation);
-            var desiredDuration = spec.End - spec.Start;
-            var tolerance = spec.Copy ? Math.Max(0.5, Math.Min(2, desiredDuration * 0.02)) : 0.3;
-            if (output.Duration <= 0 || Math.Abs(output.Duration - desiredDuration) > tolerance)
-                throw new InvalidOperationException($"导出时长异常：预计 {desiredDuration:F3} 秒，实际 {output.Duration:F3} 秒。");
-            var expectedVideo = spec.Copy ? spec.Media.VideoCodec : spec.Media.VideoCodec == "hevc" ? "hevc" : "h264";
-            if (output.VideoCodec != expectedVideo)
-                throw new InvalidOperationException($"导出视频编码异常：{output.VideoCodec}。");
-            var expectedAudio = spec.Media.Audio.FirstOrDefault(a => a.Index == spec.AudioIndex)?.Codec;
-            if (expectedAudio is null ? output.Audio.Count != 0 : output.Audio.Count != 1 || output.Audio[0].Codec != expectedAudio)
-                throw new InvalidOperationException("导出音轨与所选音轨不一致。");
-            if (output.Subtitles.Count != 0)
-                throw new InvalidOperationException("导出文件含有未预期的独立字幕轨。");
+            var output = await VerifyAsync(spec, temporary, cancellation);
+            if (spec.Source is not null && SourceStamp.Capture(spec.Media.Path) != spec.Source)
+                throw new InvalidOperationException("源视频在导出期间发生变化，已取消导出。请重新提交。");
             File.Move(temporary, spec.OutputPath);
             return output;
         }

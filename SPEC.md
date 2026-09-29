@@ -1,6 +1,6 @@
 # 极简视频截图与截取工具：规格草案
 
-状态：用户已确认，正在实现。术语见 [CONTEXT.md](./CONTEXT.md)，设计决定见 [DESIGN.md](./DESIGN.md)。
+状态：已实现首个可运行版本；复杂时间戳与字幕素材仍需实际素材验证。术语见 [CONTEXT.md](./CONTEXT.md)，设计决定见 [DESIGN.md](./DESIGN.md)。
 
 ## 目标
 
