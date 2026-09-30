@@ -90,7 +90,7 @@ internal sealed class MainForm : Form
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 148));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         Controls.Add(root);
         root.Controls.Add(video, 0, 0);
@@ -111,8 +111,8 @@ internal sealed class MainForm : Form
         var reset = Button("重置范围", () => { range.ResetRange(); return Task.CompletedTask; });
         trimControls.Controls.AddRange([setStart, setEnd, preview, fit, overview, reset]);
         root.Controls.Add(trimControls, 0, 3);
-        tips.SetToolTip(setStart, "暂停在当前画面，把左边界设到播放指针（[）。");
-        tips.SetToolTip(setEnd, "暂停在当前画面，把右边界设到播放指针（]）。");
+        tips.SetToolTip(setStart, "暂停在当前画面，把左边界设到播放指针（[）。Home 或 Shift+[ 跳到当前起点。");
+        tips.SetToolTip(setEnd, "暂停在当前画面，把右边界设到播放指针（]）。End 或 Shift+] 跳到当前终点。");
         tips.SetToolTip(range, "上方绿/橙手柄拖边界，下方白色指针拖播放位置。滚轮缩放；Shift+滚轮或右键拖动平移；底部总览定位视角。");
 
         var controls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
@@ -149,10 +149,14 @@ internal sealed class MainForm : Form
             TinyLabel("预览"), previewScale]);
         lower.Controls.Add(selectors, 0, 0);
         var settings = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
-        settings.Controls.AddRange([TinyLabel("并发"), parallel, startup]);
+        var shortcutHelp = Button("F1 快捷键总览", () => { ShowShortcutHelp(); return Task.CompletedTask; });
+        settings.Controls.AddRange([TinyLabel("并发"), parallel, startup, shortcutHelp]);
         lower.Controls.Add(settings, 0, 1);
         lower.Controls.Add(jobs, 0, 2);
-        root.Controls.Add(new Label { Dock = DockStyle.Fill, ForeColor = Color.Silver, Text = "滚轮缩放 · Shift+滚轮平移 · ←/→ 逐帧 · ↑/↓ 跳秒 · [ / ] 去头尾 · C 选封面 · Shift+D 一起导出", AutoEllipsis = true }, 0, 7);
+        root.Controls.Add(new Label { Dock = DockStyle.Fill, ForeColor = Color.Silver,
+            Text = "H/L 或 ←/→ 逐帧 · J/K 或 ↓/↑ 跳秒 · [ / ] 设头尾 · Home/End 或 Shift+[ / ] 跳头尾\n" +
+                "滚轮缩放 · Shift+滚轮平移 · 空格 播放/暂停 · C 选封面 · Shift+D 一起导出 · F1 快捷键总览",
+            TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true }, 0, 7);
         root.Controls.Add(status, 0, 8);
 
         var jobsMenu = new ContextMenuStrip();
@@ -466,6 +470,7 @@ internal sealed class MainForm : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        if (keyData == Keys.F1) { ShowShortcutHelp(); return true; }
         if ((keyData & (Keys.Control | Keys.Alt)) != 0) return base.ProcessCmdKey(ref msg, keyData);
         var key = keyData & Keys.KeyCode;
         // Let selectors keep their own arrows and typing; buttons and the timeline use editing shortcuts.
@@ -481,6 +486,12 @@ internal sealed class MainForm : Form
         return true;
     }
 
+    private void ShowShortcutHelp()
+    {
+        using var help = new ShortcutHelpForm();
+        help.ShowDialog(this);
+    }
+
     private async Task HandleShortcutAsync(Keys key, bool shift)
     {
         if (player is null) return;
@@ -494,6 +505,8 @@ internal sealed class MainForm : Form
                 case Keys.L: case Keys.Right: previewingRange = false; await player.PauseAsync(true); await player.StepAsync(false); break;
                 case Keys.J: case Keys.Down: previewingRange = false; await player.PauseAsync(true); await player.JumpAsync(-1); break;
                 case Keys.K: case Keys.Up: previewingRange = false; await player.PauseAsync(true); await player.JumpAsync(1); break;
+                case Keys.OemOpenBrackets when shift: goto case Keys.Home;
+                case Keys.OemCloseBrackets when shift: goto case Keys.End;
                 case Keys.OemOpenBrackets: await SetBoundaryAsync(true); break;
                 case Keys.OemCloseBrackets: await SetBoundaryAsync(false); break;
                 case Keys.Home: await SeekAsync(range.Start); break;
@@ -504,7 +517,8 @@ internal sealed class MainForm : Form
                 case Keys.D: await SubmitExportAsync(shift); break;
                 default: return;
             }
-            if (key is Keys.H or Keys.Left or Keys.L or Keys.Right or Keys.J or Keys.Down or Keys.K or Keys.Up or Keys.Home or Keys.End)
+            if (key is Keys.H or Keys.Left or Keys.L or Keys.Right or Keys.J or Keys.Down or Keys.K or Keys.Up or Keys.Home or Keys.End ||
+                shift && key is (Keys.OemOpenBrackets or Keys.OemCloseBrackets))
             {
                 lastPosition = (await player.PropertyAsync("time-pos")).GetDouble();
                 range.Position = lastPosition;
