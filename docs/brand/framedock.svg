@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>FrameDock 鈥?a frame, an F, and a trim boundary</title>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#151e2b"/>
+  <path d="M13 13H37V20H20V29H33V36H20V51H13Z" fill="#66e2cb"/>
+  <path d="M41 13H51V51H35V44H44V20H41Z" fill="#ffba66"/>
+</svg>

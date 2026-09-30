@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text.Json;
 using FrameDock;
 
 internal static class Program
@@ -9,16 +10,29 @@ internal static class Program
     private static int checks;
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        using var form = new MainForm();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+        var settingsPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+            "../../../../.scratch/window-tests", Guid.NewGuid().ToString("N"), "settings.json"));
+        using var form = new MainForm(settingsPath: settingsPath);
         form.Shown += async (_, _) => {
             try
             {
-                TestTimeline(Field<RangeBar>(form, "range"));
-                await TestWorkflowAsync(form);
+                if (args.Contains("--tray-memory"))
+                    await TestTrayMemoryAsync(form);
+                else
+                {
+                    await TestWindowSettingsAsync(form, settingsPath);
+                    if (!args.Contains("--window-layout"))
+                    {
+                        TestTimeline(Field<RangeBar>(form, "range"));
+                        await TestWorkflowAsync(form);
+                        await TestTrayMemoryAsync(form);
+                    }
+                }
                 Console.WriteLine($"PASS: {checks} checks");
             }
             catch (Exception error)
@@ -48,6 +62,83 @@ internal static class Program
         Console.WriteLine("PASS: " + name);
     }
     private static bool Near(double actual, double expected, double tolerance = 0.002) => Math.Abs(actual - expected) < tolerance;
+
+    private static async Task TestWindowSettingsAsync(MainForm form, string settingsPath)
+    {
+        var video = Field<Panel>(form, "video");
+        Check(Math.Abs(video.Height - video.Width * 9d / 16) <= 1,
+            "first launch sizes the preview to 16:9");
+        Check(Screen.FromControl(form).WorkingArea.Contains(form.Bounds), "default window fits the screen");
+        form.Bounds = new Rectangle(90, 80, 980, 900);
+        Call(form, "OnResizeEnd", EventArgs.Empty);
+        Field<NumericUpDown>(form, "parallel").Value = 3;
+        using (var restored = new MainForm(settingsPath: settingsPath))
+        {
+            restored.Show();
+            Check(restored.Bounds == form.Bounds && Field<NumericUpDown>(restored, "parallel").Value == 3,
+                "resizing persists size and position alongside existing settings");
+            SetField(restored, "exiting", true);
+            restored.Close();
+        }
+
+        var normalBounds = form.Bounds;
+        form.WindowState = FormWindowState.Maximized;
+        Application.DoEvents();
+        form.Close();
+        Check(!form.Visible, "closing still hides the window in the tray");
+        await CallAsync(form, "ShowFromTrayAsync");
+        Check(form.WindowState == FormWindowState.Maximized, "tray reopening preserves maximized state");
+        form.WindowState = FormWindowState.Minimized;
+        Application.DoEvents();
+        Call(form, "SaveWindowSettings");
+        using (var restored = new MainForm(settingsPath: settingsPath))
+        {
+            restored.Show();
+            Application.DoEvents();
+            Check(restored.WindowState == FormWindowState.Maximized,
+                "restarting after minimization restores the last visible state");
+            restored.WindowState = FormWindowState.Normal;
+            Application.DoEvents();
+            Check(restored.Bounds == normalBounds, "maximization does not overwrite the user-resized bounds");
+            SetField(restored, "exiting", true);
+            restored.Close();
+        }
+        form.WindowState = FormWindowState.Normal;
+        form.Bounds = new Rectangle(120, 100, 1000, 920);
+        form.Close();
+        using (var restored = new MainForm(settingsPath: settingsPath))
+        {
+            restored.Show();
+            Check(restored.Bounds == form.Bounds, "closing to tray also saves the latest bounds");
+            SetField(restored, "exiting", true);
+            restored.Close();
+        }
+        await CallAsync(form, "ShowFromTrayAsync");
+
+        File.WriteAllText(settingsPath, JsonSerializer.Serialize(new {
+            maxParallel = 2, window = new { x = -100000, y = -100000, width = 5000, height = 4000, maximized = false }
+        }));
+        using (var restored = new MainForm(settingsPath: settingsPath))
+        {
+            restored.Show();
+            Check(Screen.FromControl(restored).WorkingArea.Contains(restored.Bounds),
+                "saved bounds from a removed screen are clamped to an available screen");
+            SetField(restored, "exiting", true);
+            restored.Close();
+        }
+        File.WriteAllText(settingsPath, "{\"maxParallel\":4}");
+        using (var restored = new MainForm(settingsPath: settingsPath))
+        {
+            restored.Show();
+            var preview = Field<Panel>(restored, "video");
+            Check(Field<NumericUpDown>(restored, "parallel").Value == 4 &&
+                Math.Abs(preview.Height - preview.Width * 9d / 16) <= 1,
+                "legacy settings retain parallelism and use the new 16:9 default");
+            SetField(restored, "exiting", true);
+            restored.Close();
+        }
+        Call(form, "SaveWindowSettings");
+    }
     private static int X(RangeBar bar, double time) => 18 + (int)Math.Round((bar.Width - 36) * (time - bar.ViewStart) / bar.ViewLength);
     private static void Mouse(RangeBar bar, string method, int x, int y, MouseButtons button = MouseButtons.Left, int delta = 0)
         => Call(bar, method, new MouseEventArgs(button, 1, x, y, delta));
@@ -139,6 +230,16 @@ internal static class Program
         await CallAsync(form, "SeekAsync", 18d);
         await CallAsync(form, "SetBoundaryAsync", false);
         Check(Near(bar.End, 18, 0.04), "] sets end to actual displayed frame");
+        await CallAsync(form, "HandleShortcutAsync", Keys.OemOpenBrackets, true);
+        Check(Near((await player.PropertyAsync("time-pos")).GetDouble(), 12.5, 0.04) &&
+            Near(bar.Start, 12.5, 0.04) && Near(bar.End, 18, 0.04) &&
+            (await player.PropertyAsync("pause")).GetBoolean(),
+            "Shift+[ jumps to the selected start paused without changing boundaries");
+        await CallAsync(form, "HandleShortcutAsync", Keys.OemCloseBrackets, true);
+        Check(Near((await player.PropertyAsync("time-pos")).GetDouble(), 18, 0.04) &&
+            Near(bar.Start, 12.5, 0.04) && Near(bar.End, 18, 0.04) &&
+            (await player.PropertyAsync("pause")).GetBoolean(),
+            "Shift+] jumps to the selected end paused without changing boundaries");
         await CallAsync(form, "SeekAsync", 13d);
         await CallAsync(form, "SelectCoverAsync");
         var selected = Field<object>(form, "selectedCover");
@@ -189,6 +290,113 @@ internal static class Program
         screenshot.Save(Path.Combine(scratch, "minimum-window.png"));
         await CallAsync(form, "OpenVideoAsync", source);
         Check(Field<object?>(form, "selectedCover") is null && Field<PictureBox>(form, "coverPreview").Image is null, "opening another video clears the selected cover");
+    }
+
+    private static async Task TestTrayMemoryAsync(MainForm form)
+    {
+        var scratch = Path.GetFullPath(".scratch/tray-memory");
+        Directory.CreateDirectory(scratch);
+        var source = Path.Combine(scratch, "1080p.mp4");
+        using (var generator = MediaProcess.Start("ffmpeg", new[] { "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30", "-t", "8",
+            "-c:v", "libx264", "-preset", "ultrafast", "-g", "60", source }))
+        {
+            var errors = generator.StandardError.ReadToEndAsync();
+            await generator.WaitForExitAsync();
+            Check(generator.ExitCode == 0, "create 1080p memory fixture: " + await errors);
+        }
+        var samples = new List<object>();
+        object Sample(string stage, Process? preview = null)
+        {
+            using var host = Process.GetCurrentProcess();
+            host.Refresh();
+            preview?.Refresh();
+            var sample = new { stage, hostWorkingSetMiB = host.WorkingSet64 / 1048576d,
+                hostPrivateMiB = host.PrivateMemorySize64 / 1048576d,
+                previewWorkingSetMiB = preview is null ? 0 : preview.WorkingSet64 / 1048576d,
+                previewPrivateMiB = preview is null ? 0 : preview.PrivateMemorySize64 / 1048576d,
+                managedMiB = GC.GetTotalMemory(false) / 1048576d };
+            samples.Add(sample);
+            Console.WriteLine(JsonSerializer.Serialize(sample));
+            return sample;
+        }
+        Sample("before-open");
+        await CallAsync(form, "OpenVideoAsync", source);
+        await CallAsync(form, "SeekAsync", 3d);
+        await CallAsync(form, "SelectCoverAsync");
+        var selected = Field<object>(form, "selectedCover");
+        var coverBytes = (byte[])selected.GetType().GetProperty("Png")!.GetValue(selected)!;
+        using (var stream = new MemoryStream(coverBytes))
+        using (var image = Image.FromStream(stream))
+            Check(image.Width == 1920 && image.Height == 1080, "locked cover retains original resolution");
+        var thumbnail = Field<PictureBox>(form, "coverPreview").Image!;
+        Check(thumbnail.Width <= 172 && thumbnail.Height <= 100,
+            "cover preview retains a small thumbnail instead of a decoded 1080p bitmap");
+        var bar = Field<RangeBar>(form, "range");
+        bar.Start = 1;
+        bar.End = 5;
+        double? firstIdlePrivate = null;
+        const int cycles = 20;
+        for (var cycle = 0; cycle < cycles; cycle++)
+        {
+            var client = Field<MpvClient>(form, "player");
+            var process = Field<Process>(client, "process");
+            using var preview = Process.GetProcessById(process.Id);
+            Sample($"visible-{cycle}", preview);
+            form.Close();
+            await WaitUntilAsync(() => Field<MpvClient?>(form, "player") is null &&
+                Field<Task?>(form, "releasingPlayer") is null, 15000);
+            preview.Refresh();
+            Check(!form.Visible && preview.HasExited, $"tray cycle {cycle}: mpv exits and releases its decoder and buffers");
+            Check(Field<Task>(form, "keyframeScanTask").IsCompleted,
+                $"tray cycle {cycle}: background source scan has stopped");
+            await WaitUntilAsync(() => CanOpenExclusively(source), 3000);
+            Check(true, $"tray cycle {cycle}: video file can be opened exclusively");
+            Check(ReferenceEquals(selected, Field<object>(form, "selectedCover")) && Near(bar.Start, 1) && Near(bar.End, 5),
+                $"tray cycle {cycle}: locked cover and trim boundaries survive");
+            await Task.Delay(1800); // Include the application's one-time idle heap cleanup.
+            Sample($"tray-{cycle}");
+            using (var host = Process.GetCurrentProcess())
+            {
+                host.Refresh();
+                var current = host.PrivateMemorySize64 / 1048576d;
+                if (cycle == 1) firstIdlePrivate = current; // Allow first-use JIT/native initialization.
+                if (cycle == cycles - 1) Check(current - firstIdlePrivate!.Value < 16,
+                    "repeated reopen/hide cycles do not accumulate video-sized private memory");
+            }
+            if (cycle < cycles - 1)
+            {
+                await Task.WhenAll(CallAsync(form, "ShowFromTrayAsync"), CallAsync(form, "ShowFromTrayAsync"));
+                var restored = Field<MpvClient>(form, "player");
+                Check(Near((await restored.PropertyAsync("time-pos")).GetDouble(), 3, 0.04) &&
+                    (await restored.PropertyAsync("pause")).GetBoolean(),
+                    $"tray cycle {cycle}: concurrent reopen restores the original frame paused");
+            }
+        }
+        // Report retained managed objects separately from normal uncollected allocations.
+        // Samples above include the application's normal idle cleanup, with no test-side trimming.
+        var retainedManagedMiB = GC.GetTotalMemory(true) / 1048576d;
+        Check(retainedManagedMiB < 12, "twenty tray cycles retain only small managed editing state after collection");
+        Sample("tray-after-retention-audit");
+        // Closing while a video is loading must not create a player after the window hides.
+        await CallAsync(form, "ShowFromTrayAsync");
+        var open = CallAsync(form, "OpenVideoAsync", source);
+        form.Close();
+        await open;
+        await WaitUntilAsync(() => Field<Task?>(form, "releasingPlayer") is null, 15000);
+        Check(!form.Visible && Field<MpvClient?>(form, "player") is null,
+            "closing during video loading does not resurrect a hidden player");
+        using (File.Open(source, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            Check(true, "loading/closing race releases the video file");
+        File.WriteAllText(Path.Combine(scratch, "results.json"), JsonSerializer.Serialize(samples,
+            new JsonSerializerOptions { WriteIndented = true }));
+        await CallAsync(form, "ShowFromTrayAsync");
+    }
+
+    private static bool CanOpenExclusively(string path)
+    {
+        try { using var stream = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None); return true; }
+        catch (IOException) { return false; }
     }
 
     private static IEnumerable<Control> AllControls(Control parent)

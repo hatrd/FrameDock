@@ -40,15 +40,23 @@ internal sealed class MainForm : Form
     private readonly ListBox jobs = new() { Dock = DockStyle.Fill, BackColor = Color.FromArgb(31, 34, 40), ForeColor = Color.White,
         BorderStyle = BorderStyle.None, IntegralHeight = false };
     private readonly NotifyIcon tray;
+    private readonly Icon brandIcon;
+    private readonly Icon trayIcon;
+    private readonly SemaphoreSlim previewLifecycle = new(1, 1);
+    private readonly System.Windows.Forms.Timer idleMemoryCleanup = new() { Interval = 1500 };
     private readonly Queue<Job> waiting = new();
     private readonly HashSet<string> activePaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<Job> runningJobs = new();
-    private readonly string settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "FrameDock", "settings.json");
+    private readonly string settingsPath;
+    private Rectangle? savedWindowBounds;
+    private bool windowMaximized;
+    private bool loadingSettings = true;
+    private bool windowSettingsReady;
     private MediaInfo? media;
     private MpvClient? player;
     private Task? releasingPlayer;
     private CancellationTokenSource? keyframeScan;
+    private Task keyframeScanTask = Task.CompletedTask;
     private List<Keyframe>? keyframes;
     private bool loading;
     private CoverFrame? selectedCover;
@@ -63,10 +71,12 @@ internal sealed class MainForm : Form
     private readonly string? initialPath;
     private readonly bool startInTray;
 
-    public MainForm(string? initialPath = null, bool startInTray = false)
+    public MainForm(string? initialPath = null, bool startInTray = false, string? settingsPath = null)
     {
         this.initialPath = initialPath;
         this.startInTray = startInTray;
+        this.settingsPath = settingsPath ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "FrameDock", "settings.json");
         Text = "FrameDock";
         MinimumSize = new Size(860, 680);
         Size = new Size(1040, 800);
@@ -74,13 +84,24 @@ internal sealed class MainForm : Form
         ForeColor = Color.White;
         KeyPreview = true;
         AllowDrop = true;
-        Icon = SystemIcons.Application;
+        using (var iconStream = typeof(MainForm).Assembly.GetManifestResourceStream("FrameDock.BrandIcon")!)
+            brandIcon = new Icon(iconStream, new Size(32, 32));
+        Icon = brandIcon;
+        trayIcon = new Icon(brandIcon, SystemInformation.SmallIconSize);
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("打开", null, async (_, _) => await ShowFromTrayAsync());
         menu.Items.Add("退出", null, async (_, _) => await ExitFromTrayAsync());
-        tray = new NotifyIcon { Icon = Icon, Text = "FrameDock", Visible = true, ContextMenuStrip = menu };
+        tray = new NotifyIcon { Icon = trayIcon, Text = "FrameDock", Visible = true, ContextMenuStrip = menu };
         tray.DoubleClick += async (_, _) => await ShowFromTrayAsync();
+        idleMemoryCleanup.Tick += (_, _) => {
+            if (Visible) { idleMemoryCleanup.Stop(); return; }
+            if (loading || capturingCover || releasingPlayer is not null || runningJobs.Count + waiting.Count > 0) return;
+            idleMemoryCleanup.Stop();
+            // Collect once at the transition to idle, after async teardown has unwound.
+            // Aggressive collection returns unused managed heap segments to the OS.
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        };
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 9, Padding = new Padding(12) };
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -178,6 +199,12 @@ internal sealed class MainForm : Form
         video.DragEnter += OnDragEnter;
         video.DragDrop += OnDragDrop;
         FormClosing += OnClosing;
+        ResizeEnd += (_, _) => SaveWindowSettings();
+        SizeChanged += (_, _) => {
+            if (windowSettingsReady && WindowState != FormWindowState.Minimized &&
+                windowMaximized != (WindowState == FormWindowState.Maximized))
+                SaveWindowSettings();
+        };
         Shown += async (_, _) => {
             if (this.startInTray && this.initialPath is null) Hide();
             await InitializeAsync();
@@ -188,6 +215,48 @@ internal sealed class MainForm : Form
         ClearCover();
         UpdatePosition();
         UpdateRange();
+    }
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        PerformLayout();
+        if (savedWindowBounds is { } saved)
+        {
+            var area = Screen.FromRectangle(saved).WorkingArea;
+            var width = Math.Min(Math.Max(saved.Width, MinimumSize.Width), area.Width);
+            var height = Math.Min(Math.Max(saved.Height, MinimumSize.Height), area.Height);
+            StartPosition = FormStartPosition.Manual;
+            Bounds = new Rectangle(Math.Clamp(saved.X, area.Left, area.Right - width),
+                Math.Clamp(saved.Y, area.Top, area.Bottom - height), width, height);
+        }
+        else
+        {
+            // Measure the laid-out controls so padding, borders and DPI scaling are included.
+            var area = Screen.FromControl(this).WorkingArea;
+            var extraWidth = Width - video.Width;
+            var extraHeight = Height - video.Height;
+            var previewWidth = Math.Min(video.Width, (int)Math.Floor((area.Height - extraHeight) * 16d / 9));
+            Width = Math.Min(area.Width, Math.Max(MinimumSize.Width, previewWidth + extraWidth));
+            PerformLayout();
+            Height = Math.Min(area.Height, Math.Max(MinimumSize.Height,
+                extraHeight + (int)Math.Round(video.Width * 9d / 16)));
+            StartPosition = FormStartPosition.Manual;
+            Location = new Point(area.Left + (area.Width - Width) / 2, area.Top + (area.Height - Height) / 2);
+        }
+        if (windowMaximized) WindowState = FormWindowState.Maximized;
+        windowSettingsReady = true;
+    }
+
+    private void SaveWindowSettings()
+    {
+        if (!windowSettingsReady) return;
+        if (WindowState != FormWindowState.Minimized)
+        {
+            savedWindowBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            windowMaximized = WindowState == FormWindowState.Maximized;
+        }
+        SaveSettings();
     }
 
     private static Button Button(string text, Func<Task> action)
@@ -249,9 +318,10 @@ internal sealed class MainForm : Form
             SetStatus("正在读取画面或提交导出，请稍后再打开视频。");
             return;
         }
+        loading = true;
+        await previewLifecycle.WaitAsync();
         try
         {
-            loading = true;
             previewingRange = false;
             await seekPump;
             keyframeScan?.Cancel();
@@ -272,13 +342,24 @@ internal sealed class MainForm : Form
             subtitle.Items.Add(new TrackOption(null, "关闭字幕"));
             foreach (var track in info.Subtitles) subtitle.Items.Add(new TrackOption(track.Index, track.Label));
             subtitle.SelectedIndex = 0;
-            await AttachPlayerAsync(path, 0);
-            SetStatus($"已打开 {Path.GetFileName(path)}；正在分析可复制切点…");
-            var scan = keyframeScan = new CancellationTokenSource();
-            _ = ScanKeyframesAsync(info, scan.Token);
+            if (Visible)
+            {
+                await AttachPlayerAsync(path, 0);
+                SetStatus($"已打开 {Path.GetFileName(path)}；正在分析可复制切点…");
+                StartKeyframeScan();
+            }
         }
         catch (Exception error) { Error(error); }
-        finally { loading = false; }
+        finally { loading = false; previewLifecycle.Release(); }
+    }
+
+    private void StartKeyframeScan()
+    {
+        if (media is null || keyframes is not null || !Visible) return;
+        keyframeScan?.Cancel();
+        keyframeScan?.Dispose();
+        keyframeScan = new CancellationTokenSource();
+        keyframeScanTask = ScanKeyframesAsync(media, keyframeScan.Token);
     }
 
     private async Task WaitForTracksAsync()
@@ -339,7 +420,10 @@ internal sealed class MainForm : Form
         {
             var result = await Probe.ReadKeyframesAsync(target.Path, cancellation);
             if (cancellation.IsCancellationRequested || media != target || IsDisposed) return;
-            BeginInvoke(() => { keyframes = result; UpdateRange(); SetStatus($"已找到 {result.Count} 个可复制切点。"); });
+            BeginInvoke(() => {
+                if (cancellation.IsCancellationRequested || media != target || !Visible) return;
+                keyframes = result; UpdateRange(); SetStatus($"已找到 {result.Count} 个可复制切点。");
+            });
         }
         catch (OperationCanceledException) { }
         catch (Exception error)
@@ -488,7 +572,7 @@ internal sealed class MainForm : Form
 
     private void ShowShortcutHelp()
     {
-        using var help = new ShortcutHelpForm();
+        using var help = new ShortcutHelpForm { Icon = brandIcon };
         help.ShowDialog(this);
     }
 
@@ -541,6 +625,13 @@ internal sealed class MainForm : Form
     {
         if (player is null || media is null || loading || capturingCover) return null;
         capturingCover = true;
+        await previewLifecycle.WaitAsync();
+        if (player is null || media is null || !Visible)
+        {
+            capturingCover = false;
+            previewLifecycle.Release();
+            return null;
+        }
         var source = media;
         var target = player;
         var temporary = Path.Combine(Path.GetTempPath(), "framedock-cover-" + Guid.NewGuid().ToString("N") + ".png");
@@ -561,6 +652,7 @@ internal sealed class MainForm : Form
         finally
         {
             capturingCover = false;
+            previewLifecycle.Release();
             if (File.Exists(temporary)) File.Delete(temporary);
         }
     }
@@ -575,7 +667,19 @@ internal sealed class MainForm : Form
             using var stream = new MemoryStream(cover.Png);
             using var image = Image.FromStream(stream);
             coverPreview.Image?.Dispose();
-            coverPreview.Image = new Bitmap(image);
+            // A full-resolution decoded cover can cost tens of MB. Keep only a thumbnail
+            // here; the compressed PNG remains the exact source for export.
+            var thumbnail = new Bitmap(coverPreview.Width * 2, coverPreview.Height * 2);
+            using (var graphics = Graphics.FromImage(thumbnail))
+            {
+                graphics.Clear(Color.Black);
+                graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                var scale = Math.Min((double)thumbnail.Width / image.Width, (double)thumbnail.Height / image.Height);
+                var width = (int)Math.Round(image.Width * scale);
+                var height = (int)Math.Round(image.Height * scale);
+                graphics.DrawImage(image, (thumbnail.Width - width) / 2, (thumbnail.Height - height) / 2, width, height);
+            }
+            coverPreview.Image = thumbnail;
             coverLabel.Text = $"封面 {Clock(cover.Position)}\n已锁定 · {(cover.SubtitleIndex is null ? "无字幕" : "含字幕")}";
             SetStatus("封面已锁定；可继续调整首尾，Shift+D 一起导出。");
         }
@@ -764,14 +868,17 @@ internal sealed class MainForm : Form
             activePaths.Remove(job.Spec.OutputPath);
             runningJobs.Remove(job);
             PumpQueue();
+            if (!Visible && runningJobs.Count + waiting.Count == 0) idleMemoryCleanup.Start();
             if (exitAfterJobs && runningJobs.Count == 0 && waiting.Count == 0) ExitNow();
         }
     }
 
     private async Task ShowFromTrayAsync()
     {
+        idleMemoryCleanup.Stop();
         Show();
-        WindowState = FormWindowState.Normal;
+        if (WindowState == FormWindowState.Minimized)
+            WindowState = windowMaximized ? FormWindowState.Maximized : FormWindowState.Normal;
         Activate();
         if (releasingPlayer is not null) await releasingPlayer;
         if (media is not null && player is null) await ResumePlayerAsync();
@@ -779,30 +886,56 @@ internal sealed class MainForm : Form
 
     private async Task ResumePlayerAsync()
     {
-        if (media is null || player is not null) return;
+        await previewLifecycle.WaitAsync();
         try
         {
+            if (media is null || player is not null || !Visible) return;
             await AttachPlayerAsync(media.Path, lastPosition);
+            StartKeyframeScan();
         }
         catch (Exception error) { Error(error); }
+        finally { previewLifecycle.Release(); }
     }
 
     private async void OnClosing(object? sender, FormClosingEventArgs e)
     {
+        SaveWindowSettings();
         if (exiting) return;
         e.Cancel = true;
+        await HideToTrayAsync();
+    }
+
+    private async Task HideToTrayAsync()
+    {
         Hide();
         previewingRange = false;
-        await seekPump;
-        if (player is not null)
+        keyframeScan?.Cancel();
+        var release = releasingPlayer ??= ReleasePreviewAsync();
+        await release;
+        if (releasingPlayer == release) releasingPlayer = null;
+        if (!Visible)
         {
-            var previous = player;
-            player = null;
-            releasingPlayer = previous.DisposeAsync().AsTask();
-            await releasingPlayer;
-            releasingPlayer = null;
+            SetStatus("已缩回托盘；预览资源已释放。");
+            idleMemoryCleanup.Start();
         }
-        SetStatus("已缩回托盘；预览资源已释放。");
+    }
+
+    private async Task ReleasePreviewAsync()
+    {
+        await previewLifecycle.WaitAsync();
+        try
+        {
+            keyframeScan?.Cancel();
+            await keyframeScanTask;
+            await seekPump;
+            if (player is not null)
+            {
+                var previous = player;
+                player = null;
+                await previous.DisposeAsync();
+            }
+        }
+        finally { previewLifecycle.Release(); }
     }
 
     private async Task ExitFromTrayAsync()
@@ -815,13 +948,14 @@ internal sealed class MainForm : Form
         if (choice == DialogResult.Yes)
         {
             exitAfterJobs = true;
-            Hide();
+            await HideToTrayAsync();
             SetStatus("任务完成后退出。");
             return;
         }
         foreach (var job in runningJobs) job.Cancellation.Cancel();
         while (waiting.TryDequeue(out var job))
         {
+            job.Cover = null;
             activePaths.Remove(job.Spec.OutputPath);
             job.Cancellation.Dispose();
         }
@@ -832,6 +966,7 @@ internal sealed class MainForm : Form
 
     private void ExitNow()
     {
+        SaveWindowSettings();
         exiting = true;
         keyframeScan?.Cancel();
         tray.Visible = false;
@@ -849,19 +984,32 @@ internal sealed class MainForm : Form
                 using var document = JsonDocument.Parse(File.ReadAllText(settingsPath));
                 if (document.RootElement.TryGetProperty("maxParallel", out var value))
                     parallel.Value = Math.Clamp(value.GetInt32(), 1, 4);
+                if (document.RootElement.TryGetProperty("window", out var window) && window.ValueKind == JsonValueKind.Object &&
+                    window.TryGetProperty("width", out var width) && width.GetInt32() > 0 &&
+                    window.TryGetProperty("height", out var height) && height.GetInt32() > 0 &&
+                    window.TryGetProperty("x", out var x) && window.TryGetProperty("y", out var y))
+                {
+                    savedWindowBounds = new Rectangle(x.GetInt32(), y.GetInt32(), width.GetInt32(), height.GetInt32());
+                    windowMaximized = window.TryGetProperty("maximized", out var maximized) && maximized.GetBoolean();
+                }
             }
             using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
             startup.Checked = key?.GetValue("FrameDock") is not null;
         }
         catch (Exception error) { SetStatus("读取设置失败：" + error.Message); }
+        finally { loadingSettings = false; }
     }
 
     private void SaveSettings()
     {
+        if (loadingSettings) return;
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
-            File.WriteAllText(settingsPath, JsonSerializer.Serialize(new { maxParallel = (int)parallel.Value }));
+            var window = savedWindowBounds is { } bounds
+                ? new { x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height, maximized = windowMaximized }
+                : null;
+            File.WriteAllText(settingsPath, JsonSerializer.Serialize(new { maxParallel = (int)parallel.Value, window }));
         }
         catch (Exception error) { SetStatus("保存设置失败：" + error.Message); }
     }
@@ -882,8 +1030,12 @@ internal sealed class MainForm : Form
         if (disposing)
         {
             tips.Dispose();
+            idleMemoryCleanup.Dispose();
             coverPreview.Image?.Dispose();
             tray.Dispose();
+            brandIcon.Dispose();
+            trayIcon.Dispose();
+            keyframeScan?.Dispose();
         }
         base.Dispose(disposing);
     }

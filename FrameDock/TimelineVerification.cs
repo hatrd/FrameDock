@@ -62,7 +62,12 @@ internal static class MediaProcess
             if (process.ExitCode != 0 || !string.IsNullOrWhiteSpace(error))
                 throw new InvalidOperationException("时间轴检查失败：" + error[^Math.Min(error.Length, 1600)..]);
         }
-        finally { Kill(process); }
+        finally
+        {
+            Kill(process);
+            // Cancellation is complete only after the process has released its source file.
+            await process.WaitForExitAsync();
+        }
     }
 }
 

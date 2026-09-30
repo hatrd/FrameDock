@@ -91,7 +91,12 @@ internal static class Probe
         using var registration = MediaProcess.CancelWith(process, cancellation);
         var output = process.StandardOutput.ReadToEndAsync(cancellation);
         var error = process.StandardError.ReadToEndAsync(cancellation);
-        await process.WaitForExitAsync(cancellation);
+        try { await process.WaitForExitAsync(cancellation); }
+        finally
+        {
+            MediaProcess.Kill(process);
+            await process.WaitForExitAsync();
+        }
         if (process.ExitCode != 0) throw new InvalidOperationException($"无法读取视频：{await error}");
         using var json = JsonDocument.Parse(await output);
         var root = json.RootElement;

@@ -24,6 +24,7 @@ internal sealed class MpvClient : IAsyncDisposable
     private volatile SeekOperation? seekOperation;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> requests = new();
     private readonly CancellationTokenSource lifetime = new();
+    private readonly Task readLoop;
     private int nextRequest;
     private double timelineOrigin;
 
@@ -36,7 +37,7 @@ internal sealed class MpvClient : IAsyncDisposable
         this.pipe = pipe;
         reader = new StreamReader(pipe, new UTF8Encoding(false), leaveOpen: true);
         writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
-        _ = ReadLoopAsync();
+        readLoop = ReadLoopAsync();
     }
 
     public static async Task<MpvClient> StartAsync(IntPtr hostWindow, bool headless = false)
@@ -213,6 +214,13 @@ internal sealed class MpvClient : IAsyncDisposable
             process.Kill(entireProcessTree: true);
             await process.WaitForExitAsync();
         }
+        await readLoop;
+        PositionChanged = null;
+        PauseChanged = null;
+        reader.Dispose();
+        // StreamWriter flushes on Dispose, but shutdown has already closed the pipe.
+        try { writer.Dispose(); }
+        catch (Exception error) when (error is IOException or ObjectDisposedException) { }
         process.Dispose();
         lifetime.Dispose();
         writeLock.Dispose();
