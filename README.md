@@ -10,7 +10,7 @@
 - **选段很顺手：** 拖入视频，逐帧定位，用 `[` / `]` 掐头去尾。
 - **封面一起导出：** `C` 锁定画面，`Shift+D` 导出片段与原分辨率 PNG；继续调整片段也不会改变已选封面。
 
-**[下载 v1.1.0 · Windows x64](https://github.com/hatrd/FrameDock/releases/tag/v1.1.0)**
+**[下载 v1.1.1 · Windows x64](https://github.com/hatrd/FrameDock/releases/tag/v1.1.1)**
 
 ## 看一眼就会用
 
@@ -32,7 +32,7 @@
 
 ## 下载后怎么运行
 
-1. 下载发布页中的 `FrameDock-v1.1.0-win-x64.zip`，解压并保留包内全部文件。
+1. 下载发布页中的 `FrameDock-v1.1.1-win-x64.zip`，解压并保留包内全部文件。
 2. 安装 [.NET 8 桌面运行时](https://dotnet.microsoft.com/download/dotnet/8.0)（Windows x64 Desktop Runtime）。
 3. 双击 `FrameDock.exe`，拖入视频。缺少 FFmpeg 时，程序会通过 WinGet 安装。
 

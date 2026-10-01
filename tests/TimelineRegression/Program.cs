@@ -49,6 +49,19 @@ async Task Export(string source, string name, int keyIndex, double end, bool pre
     Console.WriteLine($"  {start:F6}–{end:F6}, PTS={key.Pts:F6}, DTS={key.Dts:F6}, origin={media.TimelineOrigin:F6}");
 }
 
+if (args.Contains("--reported-cut"))
+{
+    await Case("reported precise boundary with normalized audio", async () => {
+        var media = await Probe.ReadAsync(args[1]);
+        var spec = new ExportSpec(media, 805.984, 815 + 1d / 3, media.Audio[0].Index, null,
+            false, false, Path.Combine(run, "reported-cut.mp4"), NormalizeAudio: true);
+        var output = await Exporter.RunAsync(spec, default);
+        await Exporter.RunAsync(spec, default);
+        if (output.Verified!.VideoFrames != 280) throw new Exception("Expected 280 selected frames.");
+    });
+    Environment.ExitCode = failures.Count == 0 ? 0 : 1;
+    return;
+}
 var fixture = Path.Combine(run, "long-gop.mp4");
 await Ffmpeg("-f", "lavfi", "-i", "testsrc2=size=160x96:rate=30:duration=18",
     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=18",
@@ -86,6 +99,19 @@ foreach (var source in new[] { fixture, offsetMkv })
             throw new Exception($"Unexpected output loudness/peak: {loudness} LUFS / {peak} dBTP.");
     });
 }
+await Case("coarse time base precise frame boundary", async () => {
+    var coarseTimeBase = Path.Combine(run, "time-base-30.mp4");
+    await Ffmpeg("-i", fixture, "-map", "0", "-c", "copy", "-video_track_timescale", "30", coarseTimeBase);
+    var media = await Probe.ReadAsync(coarseTimeBase);
+    foreach (var normalize in new[] { false, true })
+    {
+        var spec = new ExportSpec(media, 6.217, 10 + 1d / 3, media.Audio[0].Index, null,
+            false, false, Path.Combine(run, $"boundary-{normalize}.mp4"), NormalizeAudio: normalize);
+        var output = await Exporter.RunAsync(spec, default);
+        await Exporter.RunAsync(spec, default);
+        if (output.Verified!.VideoFrames != 123) throw new Exception("Expected 123 selected frames.");
+    }
+});
 if (args.Contains("--loudness"))
 {
     await Case("normalized silence remains silent", async () => {

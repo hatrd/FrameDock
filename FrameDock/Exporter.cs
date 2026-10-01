@@ -207,10 +207,13 @@ internal static class Exporter
             else
             {
                 // Keep subtitle evaluation on the source timeline; seek after filtering/decoding.
+                // Preserve source timestamps: input seeking can round its offset to the video time base.
+                // A 1/30 time base otherwise shifts fractional seeks by up to half a frame.
+                Add("-copyts", "-start_at_zero");
                 coarse = spec.BurnSubtitle ? 0 : Math.Max(0, spec.Start - 5);
                 if (coarse > 0) Add("-ss", MediaProcess.Time(coarse));
                 Add("-i", spec.Media.Path);
-                if (spec.Start > coarse) Add("-ss", MediaProcess.Time(spec.Start - coarse));
+                if (spec.Start > 0) Add("-ss", MediaProcess.Time(spec.Start));
             }
             Add("-t", MediaProcess.Time(spec.End - spec.Start - packetOffset), "-map", "0:v:0");
             if (spec.AudioIndex is int audio) Add("-map", $"0:{audio}");
@@ -232,13 +235,15 @@ internal static class Exporter
                     if (spec.Media.TimelineOrigin != 0) filters.Add($"setpts=PTS-{MediaProcess.Time(spec.Media.TimelineOrigin)}/TB");
                 }
                 filters.Add("settb=AVTB");
-                filters.Add($"trim=start={MediaProcess.Time(spec.Start - coarse)}:end={MediaProcess.Time(spec.End - coarse)}");
+                // Use the same one-microsecond boundary tolerance as timeline verification.
+                // AVTB rounds timestamps to microseconds; exclude a frame exactly at End.
+                filters.Add($"trim=start={MediaProcess.Time(spec.Start - 0.000001)}:end={MediaProcess.Time(spec.End - 0.000001)}");
                 Add("-vf", string.Join(',', filters));
                 var codec = spec.Media.VideoCodec == "hevc" ? "libx265" : "libx264";
                 Add("-c:v", codec, "-preset", "fast", "-crf", codec == "libx265" ? "20" : "18");
                 Add("-fps_mode", "passthrough", "-enc_time_base:v", "filter");
                 if (audioFilter is not null)
-                    Add("-af", $"atrim=start={MediaProcess.Time(spec.Start - coarse)}:end={MediaProcess.Time(spec.End - coarse)},{audioFilter}", "-c:a", "aac", "-b:a", "192k", "-ar", "48000");
+                    Add("-af", $"atrim=start={MediaProcess.Time(spec.Start)}:end={MediaProcess.Time(spec.End)},{audioFilter}", "-c:a", "aac", "-b:a", "192k", "-ar", "48000");
                 else if (spec.AudioIndex is not null) Add("-c:a", "copy");
             }
             Add(temporary);
