@@ -67,6 +67,10 @@ internal sealed class MainForm : Form
     private bool capturingCover;
     private bool submittingExport;
     private bool previewingRange;
+    private readonly CheckBox loopRange = new() { Text = "选区循环", Appearance = Appearance.Button, AutoSize = true,
+        Height = 30, Margin = new Padding(2), TextAlign = ContentAlignment.MiddleCenter,
+        FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(43, 49, 59), ForeColor = Color.White };
+    private readonly SemaphoreSlim loopRangeLock = new(1, 1);
     private double? pendingSeek;
     private Task seekPump = Task.CompletedTask;
     private bool exiting;
@@ -134,10 +138,11 @@ internal sealed class MainForm : Form
         var fit = Button("F 放大选段", () => { range.FitSelection(); return Task.CompletedTask; });
         var overview = Button("0 全片视图", () => { range.ResetView(); return Task.CompletedTask; });
         var reset = Button("重置范围", () => { range.ResetRange(); return Task.CompletedTask; });
-        trimControls.Controls.AddRange([setStart, setEnd, preview, fit, overview, reset]);
+        trimControls.Controls.AddRange([setStart, setEnd, preview, loopRange, fit, overview, reset]);
         root.Controls.Add(trimControls, 0, 3);
         tips.SetToolTip(setStart, "暂停在当前画面，把左边界设到播放指针（[）。Home 或 Shift+[ 跳到当前起点。");
         tips.SetToolTip(setEnd, "暂停在当前画面，把右边界设到播放指针（]）。End 或 Shift+] 跳到当前终点。");
+        tips.SetToolTip(loopRange, "开启后从选区起点循环播放；修改选区会更新循环范围。空格可暂停，再次点击关闭循环。");
         tips.SetToolTip(range, "上方绿/橙手柄拖边界，下方白色指针拖播放位置。滚轮缩放；Shift+滚轮或右键拖动平移；底部总览定位视角。");
 
         var controls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
@@ -200,6 +205,11 @@ internal sealed class MainForm : Form
         previewScale.SelectedIndexChanged += async (_, _) => await SetPreviewScaleAsync();
         range.SeekRequested += async time => await SeekAsync(time);
         range.RangeChanged += UpdateRange;
+        range.RangeChanged += async () => await UpdateRangeLoopAsync();
+        loopRange.CheckedChanged += async (_, _) => {
+            loopRange.BackColor = loopRange.Checked ? Color.FromArgb(42, 105, 74) : Color.FromArgb(43, 49, 59);
+            await UpdateRangeLoopAsync(startPlayback: loopRange.Checked);
+        };
         normalizeAudio.CheckedChanged += (_, _) => { SaveSettings(); UpdateRange(); };
         copy.CheckedChanged += (_, _) => UpdateRange();
         parallel.ValueChanged += (_, _) => { SaveSettings(); PumpQueue(); };
@@ -411,6 +421,7 @@ internal sealed class MainForm : Form
                 });
             };
             await player.LoadAsync(path, media!.TimelineOrigin);
+            await player.SetRangeLoopAsync(loopRange.Checked ? range.Start : null, loopRange.Checked ? range.End : null);
             if (rotation != 0) await ApplyRotationAsync(player, rotation);
             await WaitForTracksAsync();
             await player.SetTrackAsync("aid", (audio.SelectedItem as TrackOption)?.Index);
@@ -548,9 +559,9 @@ internal sealed class MainForm : Form
         {
             await SeekAsync(range.Start);
             range.EnsureVisible(range.Start);
-            previewingRange = true;
+            previewingRange = !loopRange.Checked;
             await player.PauseAsync(false);
-            SetStatus("正在试听所选片段，到终点自动暂停。空格可随时暂停。");
+            SetStatus(loopRange.Checked ? "正在循环播放选区。空格可随时暂停。" : "正在试听所选片段，到终点自动暂停。空格可随时暂停。");
         }
         catch (Exception error) { previewingRange = false; Error(error); }
     }
@@ -560,6 +571,33 @@ internal sealed class MainForm : Form
         if (player is null) return;
         try { await SeekAsync(range.End); SetStatus("片段试听结束。"); }
         catch (Exception error) { SetStatus(error.Message); }
+    }
+
+    private async Task UpdateRangeLoopAsync(bool startPlayback = false)
+    {
+        var target = player;
+        if (target is null || loading) return;
+        await loopRangeLock.WaitAsync();
+        try
+        {
+            if (player != target || loading) return;
+            await target.SetRangeLoopAsync(loopRange.Checked ? range.Start : null, loopRange.Checked ? range.End : null);
+            if (loopRange.Checked)
+            {
+                previewingRange = false;
+                var paused = (await target.PropertyAsync("pause")).GetBoolean();
+                var position = (await target.PropertyAsync("time-pos")).GetDouble();
+                if (startPlayback || !paused && (position < range.Start || position >= range.End))
+                {
+                    await SeekAsync(range.Start);
+                    if (player != target || !loopRange.Checked) return;
+                    range.EnsureVisible(range.Start);
+                    await target.PauseAsync(false);
+                }
+            }
+        }
+        catch (Exception error) { if (player == target) Error(error); }
+        finally { loopRangeLock.Release(); }
     }
 
     private double ActualStart()
@@ -588,6 +626,11 @@ internal sealed class MainForm : Form
         {
             var paused = await player.PropertyAsync("pause");
             previewingRange = false;
+            if (paused.GetBoolean() && loopRange.Checked)
+            {
+                var position = (await player.PropertyAsync("time-pos")).GetDouble();
+                if (position < range.Start || position >= range.End) await SeekAsync(range.Start);
+            }
             await player.PauseAsync(!paused.GetBoolean());
         }
         catch (Exception error) { Error(error); }

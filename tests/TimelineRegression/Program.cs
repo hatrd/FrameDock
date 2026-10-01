@@ -170,6 +170,33 @@ foreach (var source in new[] { fixture, mkv, offset, offsetMkv, silent, vfr, hev
         for (var attempt = 0; attempt < 100 && Math.Abs(position - keys[1].Position) > 0.05; attempt++) await Task.Delay(50);
         if (Math.Abs(position - keys[1].Position) > 0.05) throw new Exception($"Preview seek {position} differs from key {keys[1].Position}.");
         if (!(await player.PropertyAsync("pause")).GetBoolean()) throw new Exception("Preview started playing without a request.");
+        await player.SetRangeLoopAsync(1, 1.6);
+        await player.SeekAsync(1);
+        await player.PauseAsync(false);
+        var wraps = 0;
+        var previous = 1.0;
+        for (var attempt = 0; attempt < 80 && wraps < 2; attempt++)
+        {
+            await Task.Delay(50);
+            var current = (await player.PropertyAsync("time-pos")).GetDouble();
+            if (current < 0.95 || current > 1.65) throw new Exception($"Loop escaped selection: {current}.");
+            if (current < previous - 0.2) wraps++;
+            previous = current;
+        }
+        if (wraps < 2) throw new Exception("Selection did not loop twice.");
+        await player.SetRangeLoopAsync(2, 2.6);
+        await player.SeekAsync(2);
+        await Task.Delay(900);
+        var updated = (await player.PropertyAsync("time-pos")).GetDouble();
+        if (updated < 1.95 || updated > 2.65) throw new Exception($"Updated loop escaped selection: {updated}.");
+        await player.PauseAsync(true);
+        await player.SetRangeLoopAsync(null, null);
+        await player.SeekAsync(2.5);
+        await player.PauseAsync(false);
+        await Task.Delay(400);
+        if ((await player.PropertyAsync("time-pos")).GetDouble() <= 2.6)
+            throw new Exception("Playback still loops after disabling selection loop.");
+        await player.PauseAsync(true);
     });
 }
 

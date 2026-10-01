@@ -140,6 +140,13 @@ internal sealed class MpvClient : IAsyncDisposable
         PositionChanged?.Invoke((await PropertyAsync("time-pos")).GetDouble());
     }
     public Task PauseAsync(bool pause) => CommandAsync("set_property", "pause", pause);
+    public async Task SetRangeLoopAsync(double? start, double? end)
+    {
+        // Clear B first so changing A cannot temporarily create an invalid loop.
+        await CommandAsync("set_property", "ab-loop-b", "no");
+        await CommandAsync("set_property", "ab-loop-a", start is double a ? (object)(a + timelineOrigin) : "no");
+        await CommandAsync("set_property", "ab-loop-b", end is double b ? (object)(b + timelineOrigin) : "no");
+    }
     public Task SeekAsync(double seconds) => RestartPlaybackAsync("seek", seconds + timelineOrigin, "absolute+exact");
     public Task JumpAsync(double seconds) => RestartPlaybackAsync("seek", seconds, "relative+exact");
     public async Task StepAsync(bool backward)
