@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -72,13 +72,24 @@ internal static class Program
         form.Bounds = new Rectangle(90, 80, 980, 900);
         Call(form, "OnResizeEnd", EventArgs.Empty);
         Field<NumericUpDown>(form, "parallel").Value = 3;
+        Field<CheckBox>(form, "normalizeAudio").Checked = true;
         using (var restored = new MainForm(settingsPath: settingsPath))
         {
             restored.Show();
+            Check(Field<CheckBox>(restored, "normalizeAudio").Checked,
+                "loudness normalization survives restart alongside window settings");
             Check(restored.Bounds == form.Bounds && Field<NumericUpDown>(restored, "parallel").Value == 3,
                 "resizing persists size and position alongside existing settings");
             SetField(restored, "exiting", true);
             restored.Close();
+        }
+
+        Field<CheckBox>(form, "normalizeAudio").Checked = false;
+        using (var restored = new MainForm(settingsPath: settingsPath))
+        {
+            Check(!Field<CheckBox>(restored, "normalizeAudio").Checked,
+                "turning loudness normalization off also survives restart");
+            SetField(restored, "exiting", true);
         }
 
         var normalBounds = form.Bounds;
@@ -264,6 +275,49 @@ internal static class Program
         var currentPosition = (await player.PropertyAsync("time-pos")).GetDouble();
         var currentPath = OutputNames.Screenshot(media, currentPosition, null);
         Check(File.Exists(currentPath) && !SHA256.HashData(File.ReadAllBytes(currentPath)).SequenceEqual(SHA256.HashData(png)), "Shift+S captures current frame without replacing locked cover");
+        // Use an asymmetric frame to verify directions, dimensions and real encoded output.
+        await CallAsync(form, "SeekAsync", 17d);
+        await CallAsync(form, "ScreenshotAsync", true);
+        var originalPosition = (await player.PropertyAsync("time-pos")).GetDouble();
+        using var original = new Bitmap(OutputNames.Screenshot(media, originalPosition, null));
+        var lockedBeforeRotation = Field<object>(form, "selectedCover");
+        foreach (var angle in new[] { 90, 180, 270 })
+        {
+            await CallAsync(form, "RotateAsync", 90);
+            Check(Field<int>(form, "rotation") == angle, $"preview rotates to {angle} degrees");
+            await CallAsync(form, "ScreenshotAsync", true);
+            using var rotated = new Bitmap(OutputNames.Screenshot(media, originalPosition, null, angle));
+            using var expected = new Bitmap(original);
+            expected.RotateFlip(angle switch { 90 => RotateFlipType.Rotate90FlipNone,
+                180 => RotateFlipType.Rotate180FlipNone, _ => RotateFlipType.Rotate270FlipNone });
+            Check(rotated.Size == expected.Size, $"{angle} degree screenshot dimensions");
+            var difference = 0d;
+            var samples = 0;
+            for (var y = 0; y < rotated.Height; y += 7)
+                for (var x = 0; x < rotated.Width; x += 7)
+                {
+                    var a = rotated.GetPixel(x, y); var b = expected.GetPixel(x, y);
+                    difference += Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B);
+                    samples += 3;
+                }
+            // Chroma resampling can differ when RGB conversion happens before versus after rotation.
+            Check(difference / samples < 8, $"{angle} degree screenshot direction matches preview filter (mean error {difference / samples:F2})");
+            copy.Checked = true;
+            bar.Start = 17; bar.End = 18;
+            await CallAsync(form, "SubmitExportAsync", false);
+            await WaitUntilAsync(() => Field<ListBox>(form, "jobs").Items.Cast<object>().All(job =>
+                (string)job.GetType().GetProperty("State")!.GetValue(job)! is "完成" or "失败"), 30000);
+            var rotatedJob = Field<ListBox>(form, "jobs").Items.Cast<object>().Last();
+            var rotatedSpec = (ExportSpec)rotatedJob.GetType().GetProperty("Spec")!.GetValue(rotatedJob)!;
+            Check(!rotatedSpec.Copy && rotatedSpec.Rotation == angle && File.Exists(rotatedSpec.OutputPath),
+                $"{angle} degree video exports and passes decoded frame verification");
+            await CheckVideoSizeAsync(rotatedSpec.OutputPath, expected.Width, expected.Height);
+            Check(ReferenceEquals(lockedBeforeRotation, Field<object>(form, "selectedCover")), "rotation preserves locked cover");
+        }
+        await CallAsync(form, "RotateAsync", -90);
+        Check(Field<int>(form, "rotation") == 180, "counterclockwise rotation subtracts 90 degrees");
+        await CallAsync(form, "RotateAsync", 180);
+        Check(Field<int>(form, "rotation") == 0, "rotation wraps to original orientation");
         var seeks = new[] { CallAsync(form, "SeekAsync", 30d), CallAsync(form, "SeekAsync", 45d), CallAsync(form, "SeekAsync", 60d) };
         await Task.WhenAll(seeks);
         Check(Near((await player.PropertyAsync("time-pos")).GetDouble(), 60, 0.04), "rapid seeks settle on the final requested position");
@@ -335,6 +389,17 @@ internal static class Program
         var bar = Field<RangeBar>(form, "range");
         bar.Start = 1;
         bar.End = 5;
+        await CallAsync(form, "RotateAsync", 90);
+        await CallAsync(form, "ScreenshotAsync", true);
+        var media = Field<MediaInfo>(form, "media");
+        var rotatedPosition = (await Field<MpvClient>(form, "player").PropertyAsync("time-pos")).GetDouble();
+        using (var portrait = new Bitmap(OutputNames.Screenshot(media, rotatedPosition, null, 90)))
+            Check(portrait.Width == 1080 && portrait.Height == 1920, "1920x1080 screenshot becomes 1080x1920");
+        var portraitSpec = new ExportSpec(media, 1, 2, null, null, false, false,
+            Path.Combine(scratch, "portrait-" + Guid.NewGuid().ToString("N") + ".mp4"), Rotation: 90);
+        await Exporter.RunAsync(portraitSpec, CancellationToken.None);
+        await CheckVideoSizeAsync(portraitSpec.OutputPath, 1080, 1920);
+        await CallAsync(form, "RotateAsync", -90);
         double? firstIdlePrivate = null;
         const int cycles = 20;
         for (var cycle = 0; cycle < cycles; cycle++)
@@ -397,6 +462,19 @@ internal static class Program
     {
         try { using var stream = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None); return true; }
         catch (IOException) { return false; }
+    }
+
+    private static async Task CheckVideoSizeAsync(string path, int width, int height)
+    {
+        using var probe = MediaProcess.Start("ffprobe", new[] { "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "json", path });
+        var output = probe.StandardOutput.ReadToEndAsync();
+        var error = probe.StandardError.ReadToEndAsync();
+        await probe.WaitForExitAsync();
+        using var json = JsonDocument.Parse(await output);
+        var stream = json.RootElement.GetProperty("streams")[0];
+        Check(probe.ExitCode == 0 && stream.GetProperty("width").GetInt32() == width &&
+            stream.GetProperty("height").GetInt32() == height, $"encoded video dimensions are {width}x{height}: {await error}");
     }
 
     private static IEnumerable<Control> AllControls(Control parent)

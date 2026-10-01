@@ -17,7 +17,7 @@ internal sealed record SourceStamp(long Length, long LastWriteTicks)
 
 internal sealed record ExportSpec(MediaInfo Media, double Start, double End, int? AudioIndex,
     int? SubtitleIndex, bool Copy, bool BurnSubtitle, string OutputPath, Keyframe? CopyKeyframe = null,
-    SourceStamp? Source = null);
+    SourceStamp? Source = null, int Rotation = 0, bool NormalizeAudio = false);
 
 internal static class OutputNames
 {
@@ -46,28 +46,31 @@ internal static class OutputNames
         return $"{Path.GetFullPath(source)}|{stamp.Length}|{stamp.LastWriteTicks}";
     }
 
-    public static string Screenshot(MediaInfo media, double position, int? subtitleIndex)
+    public static string Screenshot(MediaInfo media, double position, int? subtitleIndex, int rotation = 0)
     {
         var subtitle = subtitleIndex is null ? "suboff" : $"sub{subtitleIndex}";
-        var key = $"{SourceState(media.Path)}|{position:R}|{subtitle}";
+        var rotationKey = rotation == 0 ? "" : $"|rot{rotation}";
+        var key = $"{SourceState(media.Path)}|{position:R}|{subtitle}{rotationKey}";
         return Path.Combine(Path.GetDirectoryName(media.Path)!,
             $"{Safe(Path.GetFileNameWithoutExtension(media.Path))}__{Time(position)}__{subtitle}_{Id(key)}.png");
     }
 
     public static string Clip(MediaInfo media, double start, double end, int? audio, int? subtitle,
-        bool copy, bool burnSubtitle, string extension)
+        bool copy, bool burnSubtitle, string extension, int rotation = 0, bool normalizeAudio = false)
     {
-        var mode = copy ? "copy" : "precise";
+        var mode = (copy ? "copy" : "precise") + (normalizeAudio ? "_loud14" : "");
         var a = audio is null ? "mute" : $"a{audio}";
         var s = burnSubtitle ? $"burn{subtitle?.ToString(CultureInfo.InvariantCulture) ?? "none"}" : "suboff";
-        var key = $"{SourceState(media.Path)}|{start:R}|{end:R}|{a}|{s}|{mode}|{extension}";
+        var rotationKey = rotation == 0 ? "" : $"|rot{rotation}";
+        var key = $"{SourceState(media.Path)}|{start:R}|{end:R}|{a}|{s}|{mode}|{extension}{rotationKey}";
         return Path.Combine(Path.GetDirectoryName(media.Path)!,
             $"{Safe(Path.GetFileNameWithoutExtension(media.Path))}__{Time(start)}-{Time(end)}__{a}_{s}_{mode}_{Id(key)}{extension}");
     }
 
-    public static string ClipCover(string clipPath, MediaInfo media, double position, int? subtitleIndex)
+    public static string ClipCover(string clipPath, MediaInfo media, double position, int? subtitleIndex, int rotation = 0)
     {
-        var key = $"{SourceState(media.Path)}|{position:R}|{subtitleIndex}";
+        var rotationKey = rotation == 0 ? "" : $"|rot{rotation}";
+        var key = $"{SourceState(media.Path)}|{position:R}|{subtitleIndex}{rotationKey}";
         return Path.Combine(Path.GetDirectoryName(clipPath)!,
             $"{Path.GetFileNameWithoutExtension(clipPath)}__cover_{Time(position)}_{Id(key)}.png");
     }
@@ -75,6 +78,23 @@ internal static class OutputNames
 
 internal static class Exporter
 {
+    internal static string RotationFilter(int rotation) => rotation switch
+    {
+        0 => "",
+        90 => "transpose=clock",
+        180 => "hflip,vflip",
+        270 => "transpose=cclock",
+        _ => throw new InvalidOperationException("旋转角度必须是 0、90、180 或 270 度。")
+    };
+
+    internal static string? ReferenceFilter(ExportSpec spec)
+    {
+        var filters = new List<string>();
+        if (spec.Rotation != 0) filters.Add(RotationFilter(spec.Rotation));
+        if (spec.BurnSubtitle) filters.Add(SubtitleFilter(spec));
+        return filters.Count == 0 ? null : string.Join(',', filters);
+    }
+
     public static string ExtensionFor(MediaInfo media, int? audioIndex)
     {
         var extension = Path.GetExtension(media.Path).ToLowerInvariant();
@@ -97,7 +117,7 @@ internal static class Exporter
         var expectedVideo = spec.Copy ? spec.Media.VideoCodec : spec.Media.VideoCodec == "hevc" ? "hevc" : "h264";
         if (output.VideoCodec != expectedVideo)
             throw new InvalidOperationException($"导出视频编码异常：{output.VideoCodec}。");
-        var expectedAudio = spec.Media.Audio.FirstOrDefault(a => a.Index == spec.AudioIndex)?.Codec;
+        var expectedAudio = spec.NormalizeAudio && spec.AudioIndex is not null ? "aac" : spec.Media.Audio.FirstOrDefault(a => a.Index == spec.AudioIndex)?.Codec;
         if (expectedAudio is null ? output.Audio.Count != 0 : output.Audio.Count != 1 || output.Audio[0].Codec != expectedAudio)
             throw new InvalidOperationException("导出音轨与所选音轨不一致。");
         if (output.Subtitles.Count != 0)
@@ -127,6 +147,10 @@ internal static class Exporter
         if (!double.IsFinite(spec.Start) || !double.IsFinite(spec.End) || spec.Start < 0 ||
             spec.End <= spec.Start || spec.End > spec.Media.Duration + 0.001)
             throw new InvalidOperationException("截取范围无效。");
+        if (spec.Copy && spec.NormalizeAudio) throw new InvalidOperationException("响度标准化需要精确模式。");
+        if (spec.NormalizeAudio && spec.AudioIndex is null) throw new InvalidOperationException("响度标准化需要所选音轨。");
+        if (spec.Copy && spec.Rotation != 0) throw new InvalidOperationException("旋转视频需要重新编码。请使用精确模式。");
+        _ = RotationFilter(spec.Rotation);
         if (spec.Copy && spec.BurnSubtitle) throw new InvalidOperationException("纯复制无法画入字幕。");
         if (spec.AudioIndex is not null && !spec.Media.Audio.Any(a => a.Index == spec.AudioIndex))
             throw new InvalidOperationException("找不到所选音轨。");
@@ -158,6 +182,7 @@ internal static class Exporter
         }
         try
         {
+            var audioFilter = spec.NormalizeAudio ? await Loudness.MeasureAsync(spec, cancellation) : null;
             var start = new ProcessStartInfo(exe) {
                 UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true,
                 RedirectStandardOutput = true
@@ -199,6 +224,7 @@ internal static class Exporter
             else
             {
                 var filters = new List<string>();
+                if (spec.Rotation != 0) filters.Add(RotationFilter(spec.Rotation));
                 if (spec.BurnSubtitle)
                 {
                     if (spec.Media.TimelineOrigin != 0) filters.Add($"setpts=PTS+{MediaProcess.Time(spec.Media.TimelineOrigin)}/TB");
@@ -211,7 +237,9 @@ internal static class Exporter
                 var codec = spec.Media.VideoCodec == "hevc" ? "libx265" : "libx264";
                 Add("-c:v", codec, "-preset", "fast", "-crf", codec == "libx265" ? "20" : "18");
                 Add("-fps_mode", "passthrough", "-enc_time_base:v", "filter");
-                if (spec.AudioIndex is not null) Add("-c:a", "copy");
+                if (audioFilter is not null)
+                    Add("-af", $"atrim=start={MediaProcess.Time(spec.Start - coarse)}:end={MediaProcess.Time(spec.End - coarse)},{audioFilter}", "-c:a", "aac", "-b:a", "192k", "-ar", "48000");
+                else if (spec.AudioIndex is not null) Add("-c:a", "copy");
             }
             Add(temporary);
             using var process = new Process { StartInfo = start };
@@ -232,7 +260,7 @@ internal static class Exporter
             if (spec.Source is not null && SourceStamp.Capture(spec.Media.Path) != spec.Source)
                 throw new InvalidOperationException("源视频在导出期间发生变化，已取消导出。请重新提交。");
             File.Move(temporary, spec.OutputPath);
-            return output;
+            return output with { Path = spec.OutputPath };
         }
         finally
         {

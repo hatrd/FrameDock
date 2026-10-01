@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="../../FrameDock/MediaInfo.cs" Link="MediaInfo.cs" />
     <Compile Include="../../FrameDock/Exporter.cs" Link="Exporter.cs" />
+    <Compile Include="../../FrameDock/Loudness.cs" Link="Loudness.cs" />
     <Compile Include="../../FrameDock/TimelineVerification.cs" Link="TimelineVerification.cs" />
     <Compile Include="../../FrameDock/MpvClient.cs" Link="MpvClient.cs" />
   </ItemGroup>

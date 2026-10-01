@@ -11,7 +11,7 @@ internal sealed class MainForm : Form
     {
         public override string ToString() => Label;
     }
-    private sealed record CoverFrame(MediaInfo Media, double Position, int? SubtitleIndex, byte[] Png, SourceStamp Source);
+    private sealed record CoverFrame(MediaInfo Media, double Position, int? SubtitleIndex, byte[] Png, SourceStamp Source, int Rotation);
     private sealed class Job(ExportSpec spec, CoverFrame? cover = null)
     {
         public ExportSpec Spec { get; } = spec;
@@ -32,6 +32,7 @@ internal sealed class MainForm : Form
     private readonly ComboBox subtitle = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 205 };
     private readonly ComboBox previewScale = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 86 };
     private readonly CheckBox copy = new() { Text = "纯复制（不重编码）", Checked = true, AutoSize = true, ForeColor = Color.White };
+    private readonly CheckBox normalizeAudio = new() { Text = "响度标准化", Appearance = Appearance.Button, AutoSize = true, ForeColor = Color.White };
     private readonly CheckBox startup = new() { Text = "开机时启动", AutoSize = true, ForeColor = Color.White };
     private readonly PictureBox coverPreview = new() { Size = new Size(86, 50), SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.Black };
     private readonly Label coverLabel = new() { AutoSize = false, Width = 175, Height = 50, ForeColor = Color.Gainsboro, TextAlign = ContentAlignment.MiddleLeft };
@@ -58,6 +59,9 @@ internal sealed class MainForm : Form
     private CancellationTokenSource? keyframeScan;
     private Task keyframeScanTask = Task.CompletedTask;
     private List<Keyframe>? keyframes;
+    private int rotation;
+    private bool rotating;
+    private readonly Label rotationLabel = new() { AutoSize = true, ForeColor = Color.Gainsboro, Text = "旋转 0°" };
     private bool loading;
     private CoverFrame? selectedCover;
     private bool capturingCover;
@@ -144,8 +148,9 @@ internal sealed class MainForm : Form
             if (media is not null) Process.Start(new ProcessStartInfo(Path.GetDirectoryName(media.Path)!) { UseShellExecute = true });
             return Task.CompletedTask;
         });
-        controls.Controls.AddRange([open, play, export, copy, outputFolder]);
+        controls.Controls.AddRange([open, play, export, copy, normalizeAudio, outputFolder]);
         root.Controls.Add(controls, 0, 4);
+        tips.SetToolTip(normalizeAudio, "导出到 −14 LUFS，真峰值上限 −1 dBTP；适合偏小的网络视频录音。开启后使用精确模式，音频编码为 AAC。自动记住上次设置，预览保持原音。");
         tips.SetToolTip(copy, "纯复制会从所选起点之前的关键帧开始，可能多留一小段头部。需要准确去头时取消勾选。");
 
         var coverControls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
@@ -172,6 +177,10 @@ internal sealed class MainForm : Form
         var settings = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
         var shortcutHelp = Button("F1 快捷键总览", () => { ShowShortcutHelp(); return Task.CompletedTask; });
         settings.Controls.AddRange([TinyLabel("并发"), parallel, startup, shortcutHelp]);
+        var clockwise = Button("顺时针 90°", () => RotateAsync(90));
+        var counterclockwise = Button("逆时针 90°", () => RotateAsync(-90));
+        settings.Controls.AddRange([counterclockwise, clockwise, rotationLabel]);
+        tips.SetToolTip(clockwise, "旋转预览和新截图；导出旋转视频时自动使用精确模式。已锁定封面保持原样。");
         lower.Controls.Add(settings, 0, 1);
         lower.Controls.Add(jobs, 0, 2);
         root.Controls.Add(new Label { Dock = DockStyle.Fill, ForeColor = Color.Silver,
@@ -191,6 +200,7 @@ internal sealed class MainForm : Form
         previewScale.SelectedIndexChanged += async (_, _) => await SetPreviewScaleAsync();
         range.SeekRequested += async time => await SeekAsync(time);
         range.RangeChanged += UpdateRange;
+        normalizeAudio.CheckedChanged += (_, _) => { SaveSettings(); UpdateRange(); };
         copy.CheckedChanged += (_, _) => UpdateRange();
         parallel.ValueChanged += (_, _) => { SaveSettings(); PumpQueue(); };
         startup.CheckedChanged += (_, _) => UpdateStartup();
@@ -313,7 +323,7 @@ internal sealed class MainForm : Form
 
     private async Task OpenVideoAsync(string path)
     {
-        if (loading || capturingCover || submittingExport)
+        if (loading || capturingCover || submittingExport || rotating)
         {
             SetStatus("正在读取画面或提交导出，请稍后再打开视频。");
             return;
@@ -328,6 +338,8 @@ internal sealed class MainForm : Form
             if (player is not null) { await player.DisposeAsync(); player = null; }
             var info = await Probe.ReadAsync(path);
             media = info;
+            rotation = 0;
+            rotationLabel.Text = "旋转 0°";
             ClearCover();
             keyframes = null;
             lastPosition = 0;
@@ -399,6 +411,7 @@ internal sealed class MainForm : Form
                 });
             };
             await player.LoadAsync(path, media!.TimelineOrigin);
+            if (rotation != 0) await ApplyRotationAsync(player, rotation);
             await WaitForTracksAsync();
             await player.SetTrackAsync("aid", (audio.SelectedItem as TrackOption)?.Index);
             await player.SetTrackAsync("sid", (subtitle.SelectedItem as TrackOption)?.Index);
@@ -437,6 +450,34 @@ internal sealed class MainForm : Form
         if (loading || player is null || selector.SelectedItem is not TrackOption choice) return;
         try { await player.SetTrackAsync(property, choice.Index); }
         catch (Exception error) { Error(error); }
+    }
+
+    private static async Task ApplyRotationAsync(MpvClient target, int angle)
+    {
+        await target.PauseAsync(true);
+        var position = (await target.PropertyAsync("time-pos")).GetDouble();
+        if (angle == 0) await target.CommandAsync("vf", "clr", "");
+        else await target.CommandAsync("vf", "set", $"lavfi=[{Exporter.RotationFilter(angle)}]");
+        await target.SeekAsync(position);
+    }
+
+    private async Task RotateAsync(int delta)
+    {
+        if (player is null || loading || capturingCover || submittingExport || rotating) return;
+        rotating = true;
+        try
+        {
+            await seekPump;
+            previewingRange = false;
+            var next = (rotation + delta + 360) % 360;
+            await ApplyRotationAsync(player, next);
+            rotation = next;
+            rotationLabel.Text = $"旋转 {rotation}°";
+            UpdateRange();
+            SetStatus($"画面已旋转 {rotation}°；新截图及导出使用当前方向，已锁定封面保持原样。");
+        }
+        catch (Exception error) { Error(error); }
+        finally { rotating = false; }
     }
 
     private async Task SetPreviewScaleAsync()
@@ -523,7 +564,7 @@ internal sealed class MainForm : Form
 
     private double ActualStart()
     {
-        if (!copy.Checked || keyframes is not { Count: > 0 }) return range.Start;
+        if (rotation != 0 || normalizeAudio.Checked || !copy.Checked || keyframes is not { Count: > 0 }) return range.Start;
         var index = keyframes.FindLastIndex(frame => frame.Position <= range.Start + 0.0005);
         return index < 0 ? Math.Max(0, keyframes[0].Position) : Math.Max(0, keyframes[index].Position);
     }
@@ -533,7 +574,7 @@ internal sealed class MainForm : Form
         if (IsDisposed) return;
         var actual = ActualStart();
         rangeLabel.Text = $"保留 {Clock(range.Start)}–{Clock(range.End)}  ({range.End - range.Start:F3}s)" +
-            (copy.Checked ? keyframes is null ? "  · 切点分析中" : $"  · 复制起点 {Clock(actual)}" : "  · 精确截取");
+            (normalizeAudio.Checked ? "  · 响度 −14 LUFS（精确模式）" : rotation != 0 ? "  · 旋转导出（精确模式）" : copy.Checked ? keyframes is null ? "  · 切点分析中" : $"  · 复制起点 {Clock(actual)}" : "  · 精确截取");
     }
 
     private void UpdatePosition() => positionLabel.Text = $"画面 {Clock(lastPosition)}";
@@ -623,7 +664,7 @@ internal sealed class MainForm : Form
 
     private async Task<CoverFrame?> CaptureCoverAsync()
     {
-        if (player is null || media is null || loading || capturingCover) return null;
+        if (player is null || media is null || loading || capturingCover || rotating) return null;
         capturingCover = true;
         await previewLifecycle.WaitAsync();
         if (player is null || media is null || !Visible)
@@ -647,7 +688,7 @@ internal sealed class MainForm : Form
             using var saved = Image.FromFile(temporary);
             if (saved.Width <= 0 || saved.Height <= 0) throw new InvalidOperationException("封面尺寸无效。");
             if (SourceStamp.Capture(source.Path) != stamp) throw new InvalidOperationException("源视频已变化，请重新打开后选封面。");
-            return new CoverFrame(source, position, sub, await File.ReadAllBytesAsync(temporary), stamp);
+            return new CoverFrame(source, position, sub, await File.ReadAllBytesAsync(temporary), stamp, rotation);
         }
         finally
         {
@@ -715,7 +756,7 @@ internal sealed class MainForm : Form
         {
             var cover = currentFrame ? await CaptureCoverAsync() : selectedCover ?? await CaptureCoverAsync();
             if (cover is null) return;
-            var path = OutputNames.Screenshot(cover.Media, cover.Position, cover.SubtitleIndex);
+            var path = OutputNames.Screenshot(cover.Media, cover.Position, cover.SubtitleIndex, cover.Rotation);
             await SaveCoverAsync(cover, path);
             SetStatus("封面已保存：" + path);
         }
@@ -724,18 +765,19 @@ internal sealed class MainForm : Form
 
     private async Task SubmitExportAsync(bool includeCover = false)
     {
-        if (media is null || loading || submittingExport || capturingCover) return;
+        if (media is null || loading || submittingExport || capturingCover || rotating) return;
         submittingExport = true;
         try
         {
-            if (copy.Checked && keyframes is null)
+            if (copy.Checked && rotation == 0 && !normalizeAudio.Checked && keyframes is null)
             {
                 SetStatus("正在分析可复制切点，请稍候。");
                 return;
             }
             var sub = (subtitle.SelectedItem as TrackOption)?.Index;
             var audioTrack = (audio.SelectedItem as TrackOption)?.Index;
-            var doCopy = copy.Checked;
+            var normalize = normalizeAudio.Checked && audioTrack is not null;
+            var doCopy = copy.Checked && rotation == 0 && !normalizeAudio.Checked;
             var burn = sub is not null;
             if (doCopy && burn)
             {
@@ -749,23 +791,23 @@ internal sealed class MainForm : Form
             if (!doCopy && media.VideoCodec is not ("h264" or "hevc"))
             {
                 var proceed = MessageBox.Show(this,
-                    $"源视频编码为 {media.VideoCodec}。精确模式将输出 H.264 视频，所选音轨尽量原样复制。继续？",
+                    $"源视频编码为 {media.VideoCodec}。精确模式将输出 H.264 视频，{(normalize ? "所选音轨将标准化并编码为 AAC" : "所选音轨尽量原样复制")}。继续？",
                     "视频编码", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
                 if (proceed != DialogResult.Yes) return;
             }
             var start = doCopy ? ActualStart() : range.Start;
             if (range.End - start < 0.001) throw new InvalidOperationException("截取范围太短。");
-            var extension = Exporter.ExtensionFor(media, audioTrack);
+            var extension = normalize ? (Path.GetExtension(media.Path).Equals(".mp4", StringComparison.OrdinalIgnoreCase) ? ".mp4" : ".mkv") : Exporter.ExtensionFor(media, audioTrack);
             if (extension != Path.GetExtension(media.Path).ToLowerInvariant())
             {
                 var proceed = MessageBox.Show(this, "所选音轨与源容器可能不兼容，改用 MKV 导出？", "容器兼容性",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (proceed != DialogResult.Yes) return;
             }
-            var output = OutputNames.Clip(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, extension);
+            var output = OutputNames.Clip(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, extension, rotation, normalize);
             var copyKeyframe = doCopy ? keyframes?.FindLast(frame => frame.Position <= start + 0.0005) : null;
             var spec = new ExportSpec(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, output,
-                copyKeyframe, SourceStamp.Capture(media.Path));
+                copyKeyframe, SourceStamp.Capture(media.Path), rotation, normalize);
             var cover = includeCover ? selectedCover ?? await CaptureCoverAsync() : null;
             if (includeCover && cover is null) return;
             if (cover is not null && (cover.Media != media || cover.Source != spec.Source))
@@ -783,7 +825,7 @@ internal sealed class MainForm : Form
                 }
                 if (File.Exists(output))
                 {
-                    if (cover is not null) await SaveCoverAsync(cover, OutputNames.ClipCover(output, cover.Media, cover.Position, cover.SubtitleIndex));
+                    if (cover is not null) await SaveCoverAsync(cover, OutputNames.ClipCover(output, cover.Media, cover.Position, cover.SubtitleIndex, cover.Rotation));
                     SetStatus((cover is null ? "片段已完成：" : "片段与封面已保存：") + output);
                     return;
                 }
@@ -853,7 +895,7 @@ internal sealed class MainForm : Form
         {
             var output = await Exporter.RunAsync(job.Spec, job.Cancellation.Token);
             if (job.Cover is { } cover)
-                await SaveCoverAsync(cover, OutputNames.ClipCover(job.Spec.OutputPath, cover.Media, cover.Position, cover.SubtitleIndex));
+                await SaveCoverAsync(cover, OutputNames.ClipCover(job.Spec.OutputPath, cover.Media, cover.Position, cover.SubtitleIndex, cover.Rotation));
             UpdateJob(job, "完成");
             var timeline = output.Verified!;
             SetStatus($"{(job.Cover is null ? "片段" : "片段与封面")}已保存（核实源视频首帧 {Clock(timeline.FirstVideoSourcePosition)}，末帧 {Clock(timeline.LastVideoSourcePosition)}，" +
@@ -982,6 +1024,8 @@ internal sealed class MainForm : Form
             if (File.Exists(settingsPath))
             {
                 using var document = JsonDocument.Parse(File.ReadAllText(settingsPath));
+                if (document.RootElement.TryGetProperty("normalizeAudio", out var normalized) && normalized.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                    normalizeAudio.Checked = normalized.GetBoolean();
                 if (document.RootElement.TryGetProperty("maxParallel", out var value))
                     parallel.Value = Math.Clamp(value.GetInt32(), 1, 4);
                 if (document.RootElement.TryGetProperty("window", out var window) && window.ValueKind == JsonValueKind.Object &&
@@ -1009,7 +1053,7 @@ internal sealed class MainForm : Form
             var window = savedWindowBounds is { } bounds
                 ? new { x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height, maximized = windowMaximized }
                 : null;
-            File.WriteAllText(settingsPath, JsonSerializer.Serialize(new { maxParallel = (int)parallel.Value, window }));
+            File.WriteAllText(settingsPath, JsonSerializer.Serialize(new { maxParallel = (int)parallel.Value, normalizeAudio = normalizeAudio.Checked, window }));
         }
         catch (Exception error) { SetStatus("保存设置失败：" + error.Message); }
     }

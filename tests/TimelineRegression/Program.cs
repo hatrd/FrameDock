@@ -61,6 +61,46 @@ var offset = Path.Combine(run, "offset.mp4");
 await Ffmpeg("-i", fixture, "-map", "0", "-c", "copy", "-output_ts_offset", "5", offset);
 var offsetMkv = Path.Combine(run, "offset.mkv");
 await Ffmpeg("-i", fixture, "-map", "0", "-c", "copy", "-output_ts_offset", "5", offsetMkv);
+foreach (var source in new[] { fixture, offsetMkv })
+{
+    await Case("normalized audio " + Path.GetFileName(source), async () => {
+        var media = await Probe.ReadAsync(source);
+        var normalized = new ExportSpec(media, 6.217, 10.4, media.Audio[1].Index, null,
+            false, false, Path.Combine(run, "normalized-" + Path.GetFileName(source)),
+            Source: SourceStamp.Capture(source), NormalizeAudio: true);
+        var output = await Exporter.RunAsync(normalized, default);
+        await Exporter.RunAsync(normalized, default);
+        if (output.Audio.Single().Codec != "aac") throw new Exception("Normalized audio must be AAC.");
+        using var measurement = MediaProcess.Start("ffmpeg", ["-hide_banner", "-nostdin", "-i", output.Path,
+            "-vn", "-af", Loudness.Target + ":print_format=json", "-f", "null", "-"]);
+        var stderr = measurement.StandardError.ReadToEndAsync();
+        var stdout = measurement.StandardOutput.ReadToEndAsync();
+        await measurement.WaitForExitAsync();
+        var report = await stderr;
+        await stdout;
+        if (measurement.ExitCode != 0) throw new Exception(report);
+        using var json = JsonDocument.Parse(report[report.LastIndexOf('{')..(report.LastIndexOf('}') + 1)]);
+        var loudness = double.Parse(json.RootElement.GetProperty("input_i").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+        var peak = double.Parse(json.RootElement.GetProperty("input_tp").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+        if (Math.Abs(loudness + 14) > 0.5 || peak > -0.5)
+            throw new Exception($"Unexpected output loudness/peak: {loudness} LUFS / {peak} dBTP.");
+    });
+}
+if (args.Contains("--loudness"))
+{
+    await Case("normalized silence remains silent", async () => {
+        var silentAudio = Path.Combine(run, "silent-audio.mp4");
+        await Ffmpeg("-i", fixture, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", "3", "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", silentAudio);
+        var media = await Probe.ReadAsync(silentAudio);
+        var spec = new ExportSpec(media, 0.217, 2.4, media.Audio[0].Index, null, false, false,
+            Path.Combine(run, "normalized-silence.mp4"), NormalizeAudio: true);
+        if (await Loudness.MeasureAsync(spec, default) != "anull") throw new Exception("Silence should bypass gain.");
+        await Exporter.RunAsync(spec, default);
+    });
+    Environment.ExitCode = failures.Count == 0 ? 0 : 1;
+    return;
+}
 var hevc = Path.Combine(run, "hevc.mp4");
 await Ffmpeg("-i", fixture, "-t", "10", "-map", "0:v", "-map", "0:a:0", "-c:v", "libx265",
     "-x265-params", "keyint=90:min-keyint=90:scenecut=0:bframes=4:log-level=error", "-c:a", "copy", hevc);

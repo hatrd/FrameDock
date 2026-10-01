@@ -196,7 +196,7 @@ internal static class TimelineVerification
         foreach (var pair in new[] { (selected[0], outputFrames[0]),
                      (spec.Copy ? sourceFrames.First(f => Math.Abs(f.Pts - (outputFrames[^1].Pts - shift)) <= TimestampTolerance) : selected[^1], outputFrames[^1]) })
         {
-            var reference = await Sample(spec.Media, pair.Item1.Pts, spec.BurnSubtitle ? Exporter.SubtitleFilter(spec) : null, cancellation);
+            var reference = await Sample(spec.Media, pair.Item1.Pts, Exporter.ReferenceFilter(spec), cancellation);
             var actual = await Sample(output, pair.Item2.Pts, null, cancellation);
             var difference = reference.Zip(actual, (a, b) => Math.Abs(a - b)).Average();
             Require(spec.Copy ? reference.SequenceEqual(actual) : difference <= 8,
@@ -213,7 +213,9 @@ internal static class TimelineVerification
             var packetDuration = sourceAudio.Max(p => p.Duration);
             // Priming/pre-roll is permitted by a packet; the A/V translation must remain the same.
             var preroll = spec.CopyKeyframe is { } key ? Math.Max(0, key.Pts - key.Dts) : 0;
-            MatchPackets(sourceAudio, outputAudio, shift, absoluteStart, packetDuration + preroll + TimestampTolerance, false);
+            Require(outputAudio.Count > 0, "导出音轨没有音频包。");
+            if (!spec.NormalizeAudio)
+                MatchPackets(sourceAudio, outputAudio, shift, absoluteStart, packetDuration + preroll + TimestampTolerance, false);
             audioStart = outputAudio.Min(p => p.Pts);
             audioEnd = outputAudio.Max(p => p.Pts + p.Duration);
             var selectedAudio = sourceAudio.Where(p => p.Pts + p.Duration > absoluteStart && p.Pts < absoluteEnd).ToList();
