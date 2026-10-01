@@ -32,7 +32,7 @@ internal sealed class MainForm : Form
     private readonly ComboBox subtitle = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 205 };
     private readonly ComboBox previewScale = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 86 };
     private readonly CheckBox copy = new() { Text = "纯复制（不重编码）", Checked = true, AutoSize = true, ForeColor = Color.White };
-    private readonly CheckBox normalizeAudio = new() { Text = "响度标准化", Appearance = Appearance.Button, AutoSize = true, ForeColor = Color.White };
+    private readonly CheckBox normalizeAudio = new() { Text = "响度标准化", AutoSize = true, ForeColor = Color.White };
     private readonly CheckBox startup = new() { Text = "开机时启动", AutoSize = true, ForeColor = Color.White };
     private readonly PictureBox coverPreview = new() { Size = new Size(86, 50), SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.Black };
     private readonly Label coverLabel = new() { AutoSize = false, Width = 175, Height = 50, ForeColor = Color.Gainsboro, TextAlign = ContentAlignment.MiddleLeft };
