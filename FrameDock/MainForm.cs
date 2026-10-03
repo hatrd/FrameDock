@@ -71,6 +71,18 @@ internal sealed class MainForm : Form
         Height = 30, Margin = new Padding(2), TextAlign = ContentAlignment.MiddleCenter,
         FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(43, 49, 59), ForeColor = Color.White };
     private readonly SemaphoreSlim loopRangeLock = new(1, 1);
+    private LoopPreview? bufferedLoop;
+    private CancellationTokenSource? loopBuild;
+    private CancellationTokenSource? audioAnalysis;
+    private Task audioAnalysisTask = Task.CompletedTask;
+    private readonly CheckBox showWaveform = new() { Text = "显示波形", AutoSize = true };
+    private readonly CheckBox snapBeat = new() { Text = "节拍吸附", AutoSize = true };
+    private readonly CheckBox smoothLoop = new() { Text = "循环去爆音", AutoSize = true, Checked = true };
+    private readonly NumericUpDown bpmInput = new() { Minimum = 0, Maximum = 400, DecimalPlaces = 2, Increment = 0.1m, Width = 78 };
+    private readonly NumericUpDown beatOffset = new() { Minimum = 0, Maximum = 86400, DecimalPlaces = 3, Increment = 0.001m, Width = 86 };
+    private readonly Label beatStatus = new() { AutoSize = true, ForeColor = StudioTheme.Muted, Text = "可手动输入 BPM；0 关闭节拍网格" };
+    private readonly Control[] videoControls;
+    private readonly Button exportBundle;
     private double? pendingSeek;
     private Task seekPump = Task.CompletedTask;
     private bool exiting;
@@ -131,7 +143,7 @@ internal sealed class MainForm : Form
         tips.SetToolTip(loopRange, "开启后从选区起点循环播放；修改选区会更新循环范围。空格可暂停，再次点击关闭循环。");
         tips.SetToolTip(range, "上方绿/橙手柄拖边界，下方白色指针拖播放位置。滚轮缩放；Shift+滚轮或右键拖动平移；底部总览定位视角。");
 
-        var open = Button("打开视频", async () => await PickVideoAsync());
+        var open = Button("打开媒体", async () => await PickVideoAsync());
         var play = Button("播放 / 暂停", async () => await TogglePauseAsync());
         var export = Button("导出片段  D", async () => await SubmitExportAsync());
         var outputFolder = Button("打开输出目录", () => {
@@ -152,6 +164,8 @@ internal sealed class MainForm : Form
         var shortcutHelp = Button("快捷键  F1", () => { ShowShortcutHelp(); return Task.CompletedTask; });
         var clockwise = Button("顺时针 90°", () => RotateAsync(90));
         var counterclockwise = Button("逆时针 90°", () => RotateAsync(-90));
+        videoControls = [counterclockwise, clockwise, rotationLabel, chooseCover, shot, clearCover, coverPreview, coverLabel];
+        exportBundle = bundle;
         tips.SetToolTip(clockwise, "旋转预览和新截图；导出旋转视频时自动使用精确模式。已锁定封面保持原样。");
         // Keep playback and trimming together; export configuration has its own quiet rail.
         root.SuspendLayout();
@@ -167,7 +181,7 @@ internal sealed class MainForm : Form
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 234));
         header.Controls.Add(new Label { Text = "FrameDock", Font = StudioTheme.TitleFont, Dock = DockStyle.Fill,
             ForeColor = StudioTheme.Text, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
-        var sourceName = new Label { Text = "视频片段与封面", ForeColor = StudioTheme.Muted,
+        var sourceName = new Label { Text = "音视频片段编辑", ForeColor = StudioTheme.Muted,
             Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
         header.Controls.Add(sourceName, 1, 0);
         var headerActions = StudioFlow();
@@ -179,10 +193,11 @@ internal sealed class MainForm : Form
         workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 292));
         root.Controls.Add(workspace, 0, 1);
-        var editor = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0, 0, 18, 0) };
+        var editor = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Margin = new Padding(0, 0, 18, 0) };
         editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         editor.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 102));
         editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
         editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         workspace.Controls.Add(editor, 0, 0);
@@ -197,10 +212,24 @@ internal sealed class MainForm : Form
         positionLabel.Margin = new Padding(0, 0, 0, 4);
         rangeLabel.ForeColor = StudioTheme.Muted;
         rangeLabel.Margin = Padding.Empty;
-        readout.Controls.AddRange([TinyLabel("画面"), positionLabel, rangeLabel]);
+        readout.Controls.AddRange([TinyLabel("位置"), positionLabel, rangeLabel]);
         readout.SetFlowBreak(positionLabel, true);
         readout.SizeChanged += (_, _) => rangeLabel.MaximumSize = new Size(Math.Max(1, readout.ClientSize.Width), 0);
-        editor.Controls.Add(readout, 0, 2);
+        var beatControls = StudioFlow();
+        foreach (var toggle in new[] { showWaveform, snapBeat, smoothLoop }) toggle.ForeColor = StudioTheme.Text;
+        StudioTheme.StyleInput(bpmInput); StudioTheme.StyleInput(beatOffset);
+        var detectBpm = Button("侦测 BPM", DetectBpmAsync);
+        var halfBpm = Button("÷2", () => { bpmInput.Value /= 2; return Task.CompletedTask; });
+        var doubleBpm = Button("×2", () => { bpmInput.Value = Math.Min(bpmInput.Maximum, bpmInput.Value * 2); return Task.CompletedTask; });
+        var alignBeat = Button("此处为节拍", () => { beatOffset.Value = Math.Clamp((decimal)lastPosition, 0, beatOffset.Maximum); return Task.CompletedTask; });
+        beatControls.Controls.AddRange([showWaveform, snapBeat, smoothLoop, detectBpm, TinyLabel("BPM"), bpmInput,
+            halfBpm, doubleBpm, TinyLabel("偏移 s"), beatOffset, alignBeat, beatStatus]);
+        beatControls.SetFlowBreak(detectBpm, true);
+        beatControls.SetFlowBreak(alignBeat, true);
+        editor.Controls.Add(beatControls, 0, 2);
+        tips.SetToolTip(smoothLoop, "选段首尾各做 2ms 淡化，避免波形跳变爆音，保持选段时长。音频 WAV 导出使用相同处理；关闭可试听原始接缝。");
+        tips.SetToolTip(snapBeat, "拖动边界、播放指针及 [ / ] 按节拍吸附。侦测为估计值，可手动修改 BPM、÷2 / ×2 和节拍偏移。");
+        editor.Controls.Add(readout, 0, 3);
         trimControls.WrapContents = true;
         trimControls.Margin = Padding.Empty;
         trimControls.Controls.Add(play);
@@ -208,7 +237,7 @@ internal sealed class MainForm : Form
         StudioTheme.StyleButton(setStart, StudioTheme.Start);
         StudioTheme.StyleButton(setEnd, StudioTheme.End);
         StudioTheme.StyleToggle(loopRange);
-        editor.Controls.Add(trimControls, 0, 3);
+        editor.Controls.Add(trimControls, 0, 4);
         var sidebar = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5,
             BackColor = StudioTheme.Surface, Padding = new Padding(14), Margin = Padding.Empty };
         sidebar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -287,12 +316,12 @@ internal sealed class MainForm : Form
         status.TextAlign = ContentAlignment.MiddleLeft;
         root.Controls.Add(status, 0, 3);
         video.Paint += (_, e) => {
-            sourceName.Text = media is null ? "视频片段与封面" : Path.GetFileName(media.Path);
-            if (media is not null) return;
-            TextRenderer.DrawText(e.Graphics, "把视频拖到这里", StudioTheme.EmptyStateFont,
+            sourceName.Text = media is null ? "音视频片段编辑" : Path.GetFileName(media.Path);
+            if (media?.HasVideo == true) return;
+            TextRenderer.DrawText(e.Graphics, media is null ? "把视频或音频拖到这里" : "音频编辑 · 开启波形，按节拍选段", StudioTheme.EmptyStateFont,
                 new Rectangle(0, video.Height / 2 - 30, video.Width, 38), StudioTheme.Text,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-            TextRenderer.DrawText(e.Graphics, "MKV / MP4，或点击右上角打开视频", Font,
+            TextRenderer.DrawText(e.Graphics, "MKV / MP4 / WAV / MP3 / FLAC，或点击右上角打开媒体", Font,
                 new Rectangle(0, video.Height / 2 + 18, video.Width, 28), StudioTheme.Muted,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         };
@@ -327,6 +356,14 @@ internal sealed class MainForm : Form
             await UpdateRangeLoopAsync(startPlayback: loopRange.Checked);
         };
         normalizeAudio.CheckedChanged += (_, _) => { SaveSettings(); UpdateRange(); };
+        showWaveform.CheckedChanged += async (_, _) => {
+            range.ShowWaveform = showWaveform.Checked; range.Invalidate(); SaveSettings();
+            if (showWaveform.Checked) await AnalyzeAudioAsync();
+        };
+        snapBeat.CheckedChanged += (_, _) => { range.SnapToBeat = snapBeat.Checked; range.Invalidate(); };
+        bpmInput.ValueChanged += (_, _) => { range.Bpm = (double)bpmInput.Value; range.Invalidate(); UpdateRange(); };
+        beatOffset.ValueChanged += (_, _) => { range.BeatOffset = (double)beatOffset.Value; range.Invalidate(); };
+        smoothLoop.CheckedChanged += async (_, _) => { SaveSettings(); await UpdateRangeLoopAsync(); };
         copy.CheckedChanged += (_, _) => UpdateRange();
         parallel.ValueChanged += (_, _) => { SaveSettings(); PumpQueue(); };
         startup.CheckedChanged += (_, _) => UpdateStartup();
@@ -480,7 +517,7 @@ internal sealed class MainForm : Form
 
     private async Task PickVideoAsync()
     {
-        using var dialog = new OpenFileDialog { Filter = "视频|*.mkv;*.mp4;*.mov;*.webm;*.avi|所有文件|*.*" };
+        using var dialog = new OpenFileDialog { Filter = "音频和视频|*.mkv;*.mp4;*.mov;*.webm;*.avi;*.wav;*.mp3;*.flac;*.ogg;*.opus;*.m4a;*.aac;*.aiff;*.wma|音频|*.wav;*.mp3;*.flac;*.ogg;*.opus;*.m4a;*.aac;*.aiff;*.wma|所有文件|*.*" };
         if (dialog.ShowDialog(this) == DialogResult.OK) await OpenVideoAsync(dialog.FileName);
     }
 
@@ -488,19 +525,31 @@ internal sealed class MainForm : Form
     {
         if (loading || capturingCover || submittingExport || rotating)
         {
-            SetStatus("正在读取画面或提交导出，请稍后再打开视频。");
+            SetStatus("正在读取媒体或提交导出，请稍后再打开文件。");
             return;
         }
         loading = true;
+        loopBuild?.Cancel(); audioAnalysis?.Cancel();
+        await seekPump;
         await previewLifecycle.WaitAsync();
         try
         {
             previewingRange = false;
             await seekPump;
             keyframeScan?.Cancel();
+            await keyframeScanTask;
             if (player is not null) { await player.DisposeAsync(); player = null; }
+            bufferedLoop?.Dispose(); bufferedLoop = null;
+            await audioAnalysisTask;
             var info = await Probe.ReadAsync(path);
             media = info;
+            range.Waveform = null;
+            bpmInput.Value = beatOffset.Value = 0;
+            beatStatus.Text = "可手动输入 BPM；0 关闭节拍网格";
+            copy.Enabled = subtitle.Enabled = info.HasVideo;
+            foreach (var control in videoControls) control.Enabled = info.HasVideo;
+            exportBundle.Text = info.HasVideo ? "片段 + 封面  Shift+D" : "导出 WAV  Shift+D";
+            if (!info.HasVideo) copy.Checked = false;
             video.Invalidate();
             rotation = 0;
             rotationLabel.Text = "旋转 0°";
@@ -521,17 +570,19 @@ internal sealed class MainForm : Form
             if (Visible)
             {
                 await AttachPlayerAsync(path, 0);
-                SetStatus($"已打开 {Path.GetFileName(path)}；正在分析可复制切点…");
+                SetStatus($"已打开 {Path.GetFileName(path)}" + (info.HasVideo ? "；正在分析可复制切点…" : "；音频按采样精确裁剪，导出 WAV。"));
                 StartKeyframeScan();
             }
         }
         catch (Exception error) { Error(error); }
         finally { loading = false; previewLifecycle.Release(); }
+        if (showWaveform.Checked) await AnalyzeAudioAsync();
+        if (loopRange.Checked) await UpdateRangeLoopAsync();
     }
 
     private void StartKeyframeScan()
     {
-        if (media is null || keyframes is not null || !Visible) return;
+        if (media is null || !media.HasVideo || keyframes is not null || !Visible) return;
         keyframeScan?.Cancel();
         keyframeScan?.Dispose();
         keyframeScan = new CancellationTokenSource();
@@ -556,7 +607,7 @@ internal sealed class MainForm : Form
 
     private async Task AttachPlayerAsync(string path, double restorePosition)
     {
-        player = await MpvClient.StartAsync(video.Handle);
+        player = await MpvClient.StartAsync(video.Handle, audioOnly: media?.HasVideo == false);
         try
         {
             var attachedPlayer = player;
@@ -575,7 +626,7 @@ internal sealed class MainForm : Form
                 });
             };
             await player.LoadAsync(path, media!.TimelineOrigin);
-            await player.SetRangeLoopAsync(loopRange.Checked ? range.Start : null, loopRange.Checked ? range.End : null);
+            if (!media.HasVideo) await player.CommandAsync("set_property", "vid", "no");
             if (rotation != 0) await ApplyRotationAsync(player, rotation);
             await WaitForTracksAsync();
             await player.SetTrackAsync("aid", (audio.SelectedItem as TrackOption)?.Index);
@@ -613,7 +664,22 @@ internal sealed class MainForm : Form
     private async Task SelectTrackAsync(string property, ComboBox selector)
     {
         if (loading || player is null || selector.SelectedItem is not TrackOption choice) return;
-        try { await player.SetTrackAsync(property, choice.Index); }
+        try
+        {
+            loopBuild?.Cancel();
+            await previewLifecycle.WaitAsync();
+            try { await RestoreSourceAsync(); await player.SetTrackAsync(property, choice.Index); }
+            finally { previewLifecycle.Release(); }
+            if (property == "aid")
+            {
+                audioAnalysis?.Cancel(); await audioAnalysisTask;
+                range.Waveform = null; range.Invalidate();
+                bpmInput.Value = beatOffset.Value = 0;
+                beatStatus.Text = "音轨已切换，可重新侦测 BPM";
+                if (showWaveform.Checked) await AnalyzeAudioAsync();
+            }
+            if (loopRange.Checked) await UpdateRangeLoopAsync();
+        }
         catch (Exception error) { Error(error); }
     }
 
@@ -628,11 +694,12 @@ internal sealed class MainForm : Form
 
     private async Task RotateAsync(int delta)
     {
-        if (player is null || loading || capturingCover || submittingExport || rotating) return;
+        if (player is null || media?.HasVideo != true || loading || capturingCover || submittingExport || rotating) return;
         rotating = true;
         try
         {
             await seekPump;
+            await RestoreSourceAsync();
             previewingRange = false;
             var next = (rotation + delta + 360) % 360;
             await ApplyRotationAsync(player, next);
@@ -643,6 +710,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception error) { Error(error); }
         finally { rotating = false; }
+        if (loopRange.Checked) await UpdateRangeLoopAsync();
     }
 
     private async Task SetPreviewScaleAsync()
@@ -667,6 +735,10 @@ internal sealed class MainForm : Form
         if (target is null) return;
         try
         {
+            loopBuild?.Cancel();
+            await previewLifecycle.WaitAsync();
+            try { await RestoreSourceAsync(); }
+            finally { previewLifecycle.Release(); }
             await target.PauseAsync(true);
             while (pendingSeek is double time && player == target)
             {
@@ -691,7 +763,7 @@ internal sealed class MainForm : Form
             await seekPump;
             await player.PauseAsync(true);
             previewingRange = false;
-            var time = (await player.PropertyAsync("time-pos")).GetDouble();
+            var time = range.Snap((await player.PropertyAsync("time-pos")).GetDouble());
             if (isStart && time >= range.End || !isStart && time <= range.Start)
             {
                 SetStatus(isStart ? "起点必须早于终点；先移动终点或重置范围。" : "终点必须晚于起点；先移动起点或重置范围。");
@@ -711,6 +783,7 @@ internal sealed class MainForm : Form
         if (player is null || loading) return;
         try
         {
+            if (loopRange.Checked) { await UpdateRangeLoopAsync(true); return; }
             await SeekAsync(range.Start);
             range.EnsureVisible(range.Start);
             previewingRange = !loopRange.Checked;
@@ -730,33 +803,116 @@ internal sealed class MainForm : Form
     private async Task UpdateRangeLoopAsync(bool startPlayback = false)
     {
         var target = player;
-        if (target is null || loading) return;
+        var source = media;
+        if (target is null || source is null || loading) return;
+        loopBuild?.Cancel();
+        var build = new CancellationTokenSource();
+        loopBuild = build;
         await loopRangeLock.WaitAsync();
+        var lifecycleHeld = false;
+        LoopPreview? prepared = null;
         try
         {
-            if (player != target || loading) return;
-            await target.SetRangeLoopAsync(loopRange.Checked ? range.Start : null, loopRange.Checked ? range.End : null);
-            if (loopRange.Checked)
+            await Task.Delay(180, build.Token); // Coalesce handle motion instead of decoding every mouse event.
+            await previewLifecycle.WaitAsync(build.Token); lifecycleHeld = true;
+            if (player != target || media != source || loading || !Visible) return;
+            var paused = (await target.PropertyAsync("pause")).GetBoolean();
+            await RestoreSourceAsync();
+            if (!loopRange.Checked) return;
+            previewingRange = false;
+            SetStatus("正在缓冲无缝循环选段…");
+            prepared = await LoopPreview.CreateAsync(source, range.Start, range.End,
+                (audio.SelectedItem as TrackOption)?.Index, (subtitle.SelectedItem as TrackOption)?.Index,
+                rotation, smoothLoop.Checked, build.Token);
+            build.Token.ThrowIfCancellationRequested();
+            bufferedLoop = prepared; prepared = null;
+            await target.PauseAsync(true);
+            await target.CommandAsync("vf", "clr", "");
+            await target.CommandAsync("set_property", "lavfi-complex", bufferedLoop.Graph);
+            await target.LoadAsync(bufferedLoop.Path);
+            target.SetLoopTimeline(bufferedLoop.Start, bufferedLoop.Duration);
+            lastPosition = range.Position = range.Start;
+            range.EnsureVisible(range.Start); UpdatePosition();
+            await target.PauseAsync(startPlayback ? false : paused);
+            SetStatus("选区已缓冲，连续无缝循环；空格暂停，拖动指针返回源媒体。" + (source.HasVideo ? " 循环预览适配分辨率，导出保持原分辨率。" : ""));
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error)
+        {
+            if (player == target)
             {
-                previewingRange = false;
-                var paused = (await target.PropertyAsync("pause")).GetBoolean();
-                var position = (await target.PropertyAsync("time-pos")).GetDouble();
-                if (startPlayback || !paused && (position < range.Start || position >= range.End))
-                {
-                    await SeekAsync(range.Start);
-                    if (player != target || !loopRange.Checked) return;
-                    range.EnsureVisible(range.Start);
-                    await target.PauseAsync(false);
-                }
+                try { await RestoreSourceAsync(); }
+                catch (Exception restoreError) { SetStatus("恢复源媒体失败：" + restoreError.Message + "；请重新打开文件。"); return; }
+                SetStatus("循环播放失败：" + error.Message + "；请关闭循环后重试。");
             }
         }
-        catch (Exception error) { if (player == target) Error(error); }
-        finally { loopRangeLock.Release(); }
+        finally
+        {
+            prepared?.Dispose();
+            if (lifecycleHeld) previewLifecycle.Release();
+            loopRangeLock.Release();
+            if (loopBuild == build) loopBuild = null;
+            build.Dispose();
+        }
+    }
+
+    private async Task RestoreSourceAsync()
+    {
+        if (bufferedLoop is null || player is null || media is null) return;
+        var previous = bufferedLoop;
+        var position = (await player.PropertyAsync("time-pos")).GetDouble();
+        await player.PauseAsync(true);
+        await player.CommandAsync("set_property", "lavfi-complex", "");
+        await player.LoadAsync(media.Path, media.TimelineOrigin);
+        bufferedLoop = null; previous.Dispose();
+        await player.SetTrackAsync("aid", (audio.SelectedItem as TrackOption)?.Index);
+        await player.SetTrackAsync("sid", (subtitle.SelectedItem as TrackOption)?.Index);
+        if (!media.HasVideo) await player.CommandAsync("set_property", "vid", "no");
+        if (rotation != 0) await ApplyRotationAsync(player, rotation);
+        await player.SeekAsync(position);
+    }
+
+    private async Task AnalyzeAudioAsync()
+    {
+        if (media is null || loading || !Visible || audio.SelectedItem is not TrackOption { Index: int index }) return;
+        if (range.Waveform is not null) return;
+        if (!audioAnalysisTask.IsCompleted) { await audioAnalysisTask; return; }
+        audioAnalysis?.Dispose(); audioAnalysis = new CancellationTokenSource();
+        var token = audioAnalysis.Token;
+        var source = media;
+        audioAnalysisTask = Analyze();
+        await audioAnalysisTask;
+        async Task Analyze()
+        {
+            try
+            {
+                var envelope = await AudioEditing.AnalyzeAsync(source, index, token);
+                if (token.IsCancellationRequested || media != source || (audio.SelectedItem as TrackOption)?.Index != index) return;
+                range.Waveform = envelope; range.Invalidate();
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception error) { if (!token.IsCancellationRequested) Error(error); }
+        }
+    }
+
+    private async Task DetectBpmAsync()
+    {
+        SetStatus("正在分析节拍…");
+        await AnalyzeAudioAsync();
+        var envelope = range.Waveform;
+        if (envelope is null) { SetStatus("请选择音轨后侦测 BPM。"); return; }
+        var estimate = await Task.Run(() => AudioEditing.Detect(envelope));
+        if (range.Waveform != envelope) return;
+        if (estimate is null) { beatStatus.Text = "未找到稳定节拍，请手动输入 BPM"; SetStatus(beatStatus.Text); return; }
+        bpmInput.Value = (decimal)Math.Round(estimate.Bpm, 2);
+        beatOffset.Value = (decimal)Math.Round(estimate.Offset, 3);
+        beatStatus.Text = $"估计 {estimate.Bpm:F2} BPM · 可信度 {estimate.Confidence:P0} · 可手动校正";
+        SetStatus(beatStatus.Text);
     }
 
     private double ActualStart()
     {
-        if (rotation != 0 || normalizeAudio.Checked || !copy.Checked || keyframes is not { Count: > 0 }) return range.Start;
+        if (media?.HasVideo != true || rotation != 0 || normalizeAudio.Checked || !copy.Checked || keyframes is not { Count: > 0 }) return range.Start;
         var index = keyframes.FindLastIndex(frame => frame.Position <= range.Start + 0.0005);
         return index < 0 ? Math.Max(0, keyframes[0].Position) : Math.Max(0, keyframes[index].Position);
     }
@@ -766,7 +922,8 @@ internal sealed class MainForm : Form
         if (IsDisposed) return;
         var actual = ActualStart();
         rangeLabel.Text = $"保留 {Clock(range.Start)}–{Clock(range.End)}  ({range.End - range.Start:F3}s)" +
-            (normalizeAudio.Checked ? "  · 响度 −14 LUFS（精确模式）" : rotation != 0 ? "  · 旋转导出（精确模式）" : copy.Checked ? keyframes is null ? "  · 切点分析中" : $"  · 复制起点 {Clock(actual)}" : "  · 精确截取");
+            (media?.HasVideo == false ? "  · WAV 精确采样" : normalizeAudio.Checked ? "  · 响度 −14 LUFS（精确模式）" : rotation != 0 ? "  · 旋转导出（精确模式）" : copy.Checked ? keyframes is null ? "  · 切点分析中" : $"  · 复制起点 {Clock(actual)}" : "  · 精确截取") +
+            (range.Bpm > 0 ? $"  · {(range.End - range.Start) * range.Bpm / 60:F2} 拍" : "");
     }
 
     private void UpdatePosition() => positionLabel.Text = Clock(lastPosition);
@@ -782,6 +939,7 @@ internal sealed class MainForm : Form
             previewingRange = false;
             if (paused.GetBoolean() && loopRange.Checked)
             {
+                if (bufferedLoop is null) { await UpdateRangeLoopAsync(true); return; }
                 var position = (await player.PropertyAsync("time-pos")).GetDouble();
                 if (position < range.Start || position >= range.End) await SeekAsync(range.Start);
             }
@@ -820,11 +978,18 @@ internal sealed class MainForm : Form
         try
         {
             await seekPump;
+            if (key is Keys.H or Keys.Left or Keys.L or Keys.Right or Keys.J or Keys.Down or Keys.K or Keys.Up)
+            {
+                loopBuild?.Cancel();
+                await previewLifecycle.WaitAsync();
+                try { await RestoreSourceAsync(); }
+                finally { previewLifecycle.Release(); }
+            }
             switch (key)
             {
                 case Keys.Space: await TogglePauseAsync(); break;
-                case Keys.H: case Keys.Left: previewingRange = false; await player.PauseAsync(true); await player.StepAsync(true); break;
-                case Keys.L: case Keys.Right: previewingRange = false; await player.PauseAsync(true); await player.StepAsync(false); break;
+                case Keys.H: case Keys.Left: previewingRange = false; await player.PauseAsync(true); if (media?.HasVideo == true) await player.StepAsync(true); else await player.JumpAsync(-0.01); break;
+                case Keys.L: case Keys.Right: previewingRange = false; await player.PauseAsync(true); if (media?.HasVideo == true) await player.StepAsync(false); else await player.JumpAsync(0.01); break;
                 case Keys.J: case Keys.Down: previewingRange = false; await player.PauseAsync(true); await player.JumpAsync(-1); break;
                 case Keys.K: case Keys.Up: previewingRange = false; await player.PauseAsync(true); await player.JumpAsync(1); break;
                 case Keys.OemOpenBrackets when shift: goto case Keys.Home;
@@ -861,8 +1026,10 @@ internal sealed class MainForm : Form
 
     private async Task<CoverFrame?> CaptureCoverAsync()
     {
-        if (player is null || media is null || loading || capturingCover || rotating) return null;
+        if (player is null || media?.HasVideo != true || loading || capturingCover || rotating) return null;
+        loopBuild?.Cancel();
         capturingCover = true;
+        await seekPump;
         await previewLifecycle.WaitAsync();
         if (player is null || media is null || !Visible)
         {
@@ -876,6 +1043,7 @@ internal sealed class MainForm : Form
         try
         {
             await seekPump;
+            await RestoreSourceAsync();
             previewingRange = false;
             await target.PauseAsync(true);
             var stamp = SourceStamp.Capture(source.Path);
@@ -966,7 +1134,7 @@ internal sealed class MainForm : Form
         submittingExport = true;
         try
         {
-            if (copy.Checked && rotation == 0 && !normalizeAudio.Checked && keyframes is null)
+            if (media.HasVideo && copy.Checked && rotation == 0 && !normalizeAudio.Checked && keyframes is null)
             {
                 SetStatus("正在分析可复制切点，请稍候。");
                 return;
@@ -974,7 +1142,7 @@ internal sealed class MainForm : Form
             var sub = (subtitle.SelectedItem as TrackOption)?.Index;
             var audioTrack = (audio.SelectedItem as TrackOption)?.Index;
             var normalize = normalizeAudio.Checked && audioTrack is not null;
-            var doCopy = copy.Checked && rotation == 0 && !normalizeAudio.Checked;
+            var doCopy = media.HasVideo && copy.Checked && rotation == 0 && !normalizeAudio.Checked;
             var burn = sub is not null;
             if (doCopy && burn)
             {
@@ -985,7 +1153,7 @@ internal sealed class MainForm : Form
                 doCopy = choice == DialogResult.No;
                 burn = choice == DialogResult.Yes;
             }
-            if (!doCopy && media.VideoCodec is not ("h264" or "hevc"))
+            if (media.HasVideo && !doCopy && media.VideoCodec is not ("h264" or "hevc"))
             {
                 var proceed = MessageBox.Show(this,
                     $"源视频编码为 {media.VideoCodec}。精确模式将输出 H.264 视频，{(normalize ? "所选音轨将标准化并编码为 AAC" : "所选音轨尽量原样复制")}。继续？",
@@ -994,17 +1162,19 @@ internal sealed class MainForm : Form
             }
             var start = doCopy ? ActualStart() : range.Start;
             if (range.End - start < 0.001) throw new InvalidOperationException("截取范围太短。");
-            var extension = normalize ? (Path.GetExtension(media.Path).Equals(".mp4", StringComparison.OrdinalIgnoreCase) ? ".mp4" : ".mkv") : Exporter.ExtensionFor(media, audioTrack);
-            if (extension != Path.GetExtension(media.Path).ToLowerInvariant())
+            var extension = !media.HasVideo ? ".wav" : normalize ? (Path.GetExtension(media.Path).Equals(".mp4", StringComparison.OrdinalIgnoreCase) ? ".mp4" : ".mkv") : Exporter.ExtensionFor(media, audioTrack);
+            if (media.HasVideo && extension != Path.GetExtension(media.Path).ToLowerInvariant())
             {
                 var proceed = MessageBox.Show(this, "所选音轨与源容器可能不兼容，改用 MKV 导出？", "容器兼容性",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (proceed != DialogResult.Yes) return;
             }
-            var output = OutputNames.Clip(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, extension, rotation, normalize);
+            var smooth = !media.HasVideo && smoothLoop.Checked;
+            var output = OutputNames.Clip(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, extension, rotation, normalize, smooth);
             var copyKeyframe = doCopy ? keyframes?.FindLast(frame => frame.Position <= start + 0.0005) : null;
             var spec = new ExportSpec(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, output,
-                copyKeyframe, SourceStamp.Capture(media.Path), rotation, normalize);
+                copyKeyframe, SourceStamp.Capture(media.Path), rotation, normalize, smooth);
+            includeCover &= media.HasVideo;
             var cover = includeCover ? selectedCover ?? await CaptureCoverAsync() : null;
             if (includeCover && cover is null) return;
             if (cover is not null && (cover.Media != media || cover.Source != spec.Source))
@@ -1109,6 +1279,11 @@ internal sealed class MainForm : Form
             if (job.Cover is { } cover)
                 await SaveCoverAsync(cover, OutputNames.ClipCover(job.Spec.OutputPath, cover.Media, cover.Position, cover.SubtitleIndex, cover.Rotation));
             UpdateJob(job, "完成");
+            if (!output.HasVideo)
+            {
+                SetStatus($"音频已保存（核实采样时长 {output.Duration:F6} 秒）：{job.Spec.OutputPath}");
+                return;
+            }
             var timeline = output.Verified!;
             SetStatus($"{(job.Cover is null ? "片段" : "片段与封面")}已保存（核实源视频首帧 {Clock(timeline.FirstVideoSourcePosition)}，末帧 {Clock(timeline.LastVideoSourcePosition)}，" +
                 $"成品时长 {output.Duration:F3} 秒）：{job.Spec.OutputPath}");
@@ -1149,6 +1324,8 @@ internal sealed class MainForm : Form
         }
         catch (Exception error) { Error(error); }
         finally { previewLifecycle.Release(); }
+        if (showWaveform.Checked) await AnalyzeAudioAsync();
+        if (loopRange.Checked) await UpdateRangeLoopAsync();
     }
 
     private async void OnClosing(object? sender, FormClosingEventArgs e)
@@ -1162,6 +1339,7 @@ internal sealed class MainForm : Form
     private async Task HideToTrayAsync()
     {
         Hide();
+        loopBuild?.Cancel(); audioAnalysis?.Cancel();
         previewingRange = false;
         keyframeScan?.Cancel();
         var release = releasingPlayer ??= ReleasePreviewAsync();
@@ -1176,11 +1354,14 @@ internal sealed class MainForm : Form
 
     private async Task ReleasePreviewAsync()
     {
+        await seekPump;
         await previewLifecycle.WaitAsync();
         try
         {
             keyframeScan?.Cancel();
+            audioAnalysis?.Cancel();
             await keyframeScanTask;
+            await audioAnalysisTask;
             await seekPump;
             if (player is not null)
             {
@@ -1188,13 +1369,20 @@ internal sealed class MainForm : Form
                 player = null;
                 await previous.DisposeAsync();
             }
+            bufferedLoop?.Dispose(); bufferedLoop = null;
+            range.Waveform = null;
         }
         finally { previewLifecycle.Release(); }
     }
 
     private async Task ExitFromTrayAsync()
     {
-        if (runningJobs.Count + waiting.Count == 0) { ExitNow(); return; }
+        if (runningJobs.Count + waiting.Count == 0)
+        {
+            loopBuild?.Cancel(); audioAnalysis?.Cancel();
+            await ReleasePreviewAsync();
+            ExitNow(); return;
+        }
         var choice = MessageBox.Show(this,
             "还有导出任务。\n\n是：等待完成后退出\n否：取消任务并退出\n取消：继续运行",
             "退出 FrameDock", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
@@ -1223,9 +1411,10 @@ internal sealed class MainForm : Form
         SaveWindowSettings();
         exiting = true;
         keyframeScan?.Cancel();
+        loopBuild?.Cancel(); audioAnalysis?.Cancel();
         tray.Visible = false;
         tray.Dispose();
-        if (player is not null) _ = player.DisposeAsync();
+        _ = ReleasePreviewAsync();
         Close();
     }
 
@@ -1238,6 +1427,10 @@ internal sealed class MainForm : Form
                 using var document = JsonDocument.Parse(File.ReadAllText(settingsPath));
                 if (document.RootElement.TryGetProperty("normalizeAudio", out var normalized) && normalized.ValueKind is JsonValueKind.True or JsonValueKind.False)
                     normalizeAudio.Checked = normalized.GetBoolean();
+                if (document.RootElement.TryGetProperty("showWaveform", out var wave) && wave.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                    showWaveform.Checked = wave.GetBoolean();
+                if (document.RootElement.TryGetProperty("smoothLoop", out var smooth) && smooth.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                    smoothLoop.Checked = smooth.GetBoolean();
                 if (document.RootElement.TryGetProperty("maxParallel", out var value))
                     parallel.Value = Math.Clamp(value.GetInt32(), 1, 4);
                 if (document.RootElement.TryGetProperty("window", out var window) && window.ValueKind == JsonValueKind.Object &&
@@ -1265,7 +1458,8 @@ internal sealed class MainForm : Form
             var window = savedWindowBounds is { } bounds
                 ? new { x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height, maximized = windowMaximized }
                 : null;
-            File.WriteAllText(settingsPath, JsonSerializer.Serialize(new { maxParallel = (int)parallel.Value, normalizeAudio = normalizeAudio.Checked, window }));
+            File.WriteAllText(settingsPath, JsonSerializer.Serialize(new { maxParallel = (int)parallel.Value, normalizeAudio = normalizeAudio.Checked,
+                showWaveform = showWaveform.Checked, smoothLoop = smoothLoop.Checked, window }));
         }
         catch (Exception error) { SetStatus("保存设置失败：" + error.Message); }
     }

@@ -7,7 +7,10 @@ namespace FrameDock;
 internal sealed record MediaTrack(int Index, string Codec, string Label, bool IsDefault);
 internal sealed record MediaInfo(string Path, double Duration, string VideoCodec,
     IReadOnlyList<MediaTrack> Audio, IReadOnlyList<MediaTrack> Subtitles,
-    double TimelineOrigin = 0, string VideoTimeBase = "1/1000", VerifiedTimeline? Verified = null);
+    double TimelineOrigin = 0, string VideoTimeBase = "1/1000", VerifiedTimeline? Verified = null)
+{
+    public bool HasVideo => VideoCodec.Length > 0;
+}
 // Pts/Dts are original source timestamps. Position is relative to the player's origin.
 internal sealed record Keyframe(double Pts, double Dts, double TimelineOrigin = 0,
     long? RawPts = null, long? RawDts = null, string TimeBase = "1/1000")
@@ -115,7 +118,9 @@ internal static class Probe
         {
             var kind = stream.GetProperty("codec_type").GetString();
             var currentCodec = stream.TryGetProperty("codec_name", out var c) ? c.GetString() ?? "unknown" : "unknown";
-            if (kind == "video" && codec is null)
+            var attachedPicture = stream.TryGetProperty("disposition", out var pic) &&
+                pic.TryGetProperty("attached_pic", out var attached) && attached.GetInt32() == 1;
+            if (kind == "video" && codec is null && !attachedPicture)
             {
                 codec = currentCodec;
                 timeBase = stream.GetProperty("time_base").GetString()!;
@@ -133,8 +138,9 @@ internal static class Probe
             var track = new MediaTrack(index, currentCodec, label, isDefault);
             (kind == "audio" ? audio : subtitles).Add(track);
         }
-        if (codec is null) throw new InvalidOperationException("文件没有可播放的视频轨。");
-        return new MediaInfo(path, duration, codec, audio, subtitles, origin, timeBase);
+        if (codec is null && audio.Count == 0) throw new InvalidOperationException("文件没有可播放的音频或视频轨。");
+        if (!double.IsFinite(duration) || duration <= 0) throw new InvalidOperationException("媒体时长无效。");
+        return new MediaInfo(path, duration, codec ?? "", audio, subtitles, origin, timeBase);
     }
 
     public static async Task<List<Keyframe>> ReadKeyframesAsync(string path, CancellationToken cancellation)

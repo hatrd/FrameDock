@@ -23,6 +23,12 @@ internal sealed class RangeBar : Control
     public double ViewStart => viewStart;
     public double ViewLength => viewLength;
     public bool IsScrubbing => dragging == DragTarget.Play;
+    public AudioEnvelope? Waveform { get; set; }
+    public bool ShowWaveform { get; set; }
+    public bool SnapToBeat { get; set; }
+    public double Bpm { get; set; }
+    public double BeatOffset { get; set; }
+    public double Snap(double time) => SnapToBeat ? AudioEditing.Snap(time, Bpm, BeatOffset, duration) : time;
 
     public double Duration
     {
@@ -40,12 +46,12 @@ internal sealed class RangeBar : Control
     public double Start
     {
         get => start;
-        set { start = Math.Clamp(value, 0, Math.Max(0, end - MinimumRange)); Invalidate(); RangeChanged?.Invoke(); }
+        set { start = Math.Clamp(Snap(value), 0, Math.Max(0, end - MinimumRange)); Invalidate(); RangeChanged?.Invoke(); }
     }
     public double End
     {
         get => end;
-        set { end = Math.Clamp(value, Math.Min(duration, start + MinimumRange), duration); Invalidate(); RangeChanged?.Invoke(); }
+        set { end = Math.Clamp(Snap(value), Math.Min(duration, start + MinimumRange), duration); Invalidate(); RangeChanged?.Invoke(); }
     }
 
     public RangeBar()
@@ -124,6 +130,28 @@ internal sealed class RangeBar : Control
         var right = Math.Clamp(X(end), PaddingX, Width - PaddingX);
         g.FillRectangle(wash, left, Center - 20, Math.Max(0, right - left), 45);
         g.FillRectangle(selectedBrush, left, Center - 4, Math.Max(0, right - left), 8);
+        if (ShowWaveform && Waveform is { } waveform)
+        {
+            using var wavePen = new Pen(StudioTheme.Muted);
+            for (var x = PaddingX; x < Width - PaddingX; x++)
+            {
+                var first = Math.Max(0, (int)(Time(x) / waveform.Step));
+                var last = Math.Min(waveform.Peaks.Length - 1, (int)(Time(x + 1) / waveform.Step));
+                var peak = 0f;
+                for (var i = first; i <= last; i++) peak = Math.Max(peak, waveform.Peaks[i]);
+                var height = Math.Max(1, (int)(Math.Min(1, peak) * 19));
+                g.DrawLine(wavePen, x, Center - height, x, Center + height);
+            }
+        }
+        if (Bpm > 0)
+        {
+            var beat = 60 / Bpm;
+            var stride = Math.Max(1, (int)Math.Ceiling(viewLength / beat / Math.Max(1, TrackWidth / 12)));
+            using var beatPen = new Pen(SnapToBeat ? StudioTheme.Accent : StudioTheme.Muted);
+            for (var n = Math.Ceiling((viewStart - BeatOffset) / beat / stride) * stride;
+                 BeatOffset + n * beat <= viewStart + viewLength; n += stride)
+                g.DrawLine(beatPen, X(BeatOffset + n * beat), Center + 22, X(BeatOffset + n * beat), Center + 28);
+        }
         DrawBoundary(start, StartGrip, startBrush, "[");
         DrawBoundary(end, EndGrip, endBrush, "]");
         if (IsTimeVisible(position))
@@ -236,7 +264,7 @@ internal sealed class RangeBar : Control
         {
             case DragTarget.Start: Start = time; break;
             case DragTarget.End: End = time; break;
-            case DragTarget.Play: Position = time; SeekRequested?.Invoke(time); break;
+            case DragTarget.Play: time = Snap(time); Position = time; SeekRequested?.Invoke(time); break;
             case DragTarget.Overview: SetView((double)(x - PaddingX) / TrackWidth * duration - viewLength / 2, viewLength); break;
         }
     }

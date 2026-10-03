@@ -20,6 +20,7 @@ internal sealed class MpvClient : IAsyncDisposable
         public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Started { get; set; }
         public double? PreviousPosition { get; init; }
+        public bool Loading { get; init; }
     }
     private volatile SeekOperation? seekOperation;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> requests = new();
@@ -27,9 +28,15 @@ internal sealed class MpvClient : IAsyncDisposable
     private readonly Task readLoop;
     private int nextRequest;
     private double timelineOrigin;
+    private double loopStart;
+    private double loopDuration;
+    private double MapPosition(double time) => loopDuration > 0
+        ? loopStart + Math.Max(0, time) % loopDuration : time - timelineOrigin;
+    public void SetLoopTimeline(double start, double duration) { loopStart = start; loopDuration = duration; }
 
     public event Action<double>? PositionChanged;
     public event Action<bool>? PauseChanged;
+    internal event Action<string>? PlaybackEvent;
 
     private MpvClient(Process process, NamedPipeClientStream pipe)
     {
@@ -40,22 +47,21 @@ internal sealed class MpvClient : IAsyncDisposable
         readLoop = ReadLoopAsync();
     }
 
-    public static async Task<MpvClient> StartAsync(IntPtr hostWindow, bool headless = false)
+    public static async Task<MpvClient> StartAsync(IntPtr hostWindow, bool headless = false, bool audioOnly = false)
     {
         var exe = ToolPaths.Find("mpv") ?? throw new InvalidOperationException("找不到 mpv.exe，请使用发布包或设置 FRAMEDOCK_MPV。");
         var pipeName = "framedock-" + Guid.NewGuid().ToString("N");
         var start = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true };
         foreach (var arg in new[] { "--no-config", "--no-osc", "--no-input-default-bindings", "--input-vo-keyboard=no",
-                     "--idle=yes", "--pause=yes", "--force-window=" + (headless ? "no" : "yes"),
+                     "--idle=yes", "--pause=yes", "--force-window=" + (headless || audioOnly ? "no" : "yes"),
                      "--rebase-start-time=no", "--keep-open=yes", "--terminal=no", "--sub-auto=no",
                      "--wid=" + unchecked((uint)hostWindow.ToInt64()).ToString(CultureInfo.InvariantCulture),
                      "--input-ipc-server=" + pipeName })
             start.ArgumentList.Add(arg);
-        if (headless)
-        {
-            start.ArgumentList.Add("--vo=null");
-            start.ArgumentList.Add("--ao=null");
-        }
+        if (headless || audioOnly) start.ArgumentList.Add("--vo=null");
+        if (headless) start.ArgumentList.Add("--ao=null");
+        if (Environment.GetEnvironmentVariable("FRAMEDOCK_MPV_LOG") is { Length: > 0 } log)
+            start.ArgumentList.Add("--log-file=" + log);
         var process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 mpv。");
         var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         try
@@ -83,10 +89,11 @@ internal sealed class MpvClient : IAsyncDisposable
             {
                 using var document = JsonDocument.Parse(line);
                 var root = document.RootElement;
+                if (root.TryGetProperty("event", out var observedEvent)) PlaybackEvent?.Invoke(observedEvent.GetString() ?? "");
                 if (root.TryGetProperty("event", out var playbackEvent) && seekOperation is { } operation)
                 {
                     var eventName = playbackEvent.GetString();
-                    if (eventName is "seek" or "file-loaded") operation.Started = true;
+                    if (eventName == "file-loaded" || !operation.Loading && eventName == "seek") operation.Started = true;
                     if (eventName == "end-file" && root.TryGetProperty("reason", out var reason) && reason.GetString() == "error")
                         operation.Completion.TrySetException(new InvalidOperationException("mpv 无法读取视频。"));
                     if (operation.Started && eventName is "playback-restart" or "end-file")
@@ -102,7 +109,7 @@ internal sealed class MpvClient : IAsyncDisposable
                     {
                         if (seekOperation is { PreviousPosition: double previous } step && Math.Abs(value.GetDouble() - previous) > 0.000001)
                             step.Completion.TrySetResult();
-                        PositionChanged?.Invoke(value.GetDouble() - timelineOrigin);
+                        PositionChanged?.Invoke(MapPosition(value.GetDouble()));
                     }
                     if (name.GetString() == "pause" && value.ValueKind is JsonValueKind.True or JsonValueKind.False)
                         PauseChanged?.Invoke(value.GetBoolean());
@@ -129,12 +136,13 @@ internal sealed class MpvClient : IAsyncDisposable
         finally { writeLock.Release(); }
         var reply = await pending.Task.WaitAsync(TimeSpan.FromSeconds(15));
         if (reply.TryGetProperty("error", out var error) && error.GetString() != "success")
-            throw new InvalidOperationException("mpv: " + error.GetString());
+            throw new InvalidOperationException("mpv: " + error.GetString() + "（" + string.Join(" ", command) + "）");
         return reply.TryGetProperty("data", out var data) ? data.Clone() : default;
     }
 
     public async Task LoadAsync(string path, double origin = 0)
     {
+        loopDuration = 0;
         timelineOrigin = origin;
         await RestartPlaybackAsync("loadfile", path, "replace");
         PositionChanged?.Invoke((await PropertyAsync("time-pos")).GetDouble());
@@ -174,13 +182,13 @@ internal sealed class MpvClient : IAsyncDisposable
     {
         var value = await CommandAsync("get_property", name);
         return name == "time-pos" && value.ValueKind == JsonValueKind.Number
-            ? JsonSerializer.SerializeToElement(value.GetDouble() - timelineOrigin) : value;
+            ? JsonSerializer.SerializeToElement(MapPosition(value.GetDouble())) : value;
     }
 
     private async Task RestartPlaybackAsync(params object?[] command)
     {
         await seekLock.WaitAsync(lifetime.Token);
-        var operation = new SeekOperation();
+        var operation = new SeekOperation { Loading = command[0]?.ToString() == "loadfile" };
         seekOperation = operation;
         try
         {
@@ -224,6 +232,7 @@ internal sealed class MpvClient : IAsyncDisposable
         await readLoop;
         PositionChanged = null;
         PauseChanged = null;
+        PlaybackEvent = null;
         reader.Dispose();
         // StreamWriter flushes on Dispose, but shutdown has already closed the pipe.
         try { writer.Dispose(); }

@@ -17,7 +17,7 @@ internal sealed record SourceStamp(long Length, long LastWriteTicks)
 
 internal sealed record ExportSpec(MediaInfo Media, double Start, double End, int? AudioIndex,
     int? SubtitleIndex, bool Copy, bool BurnSubtitle, string OutputPath, Keyframe? CopyKeyframe = null,
-    SourceStamp? Source = null, int Rotation = 0, bool NormalizeAudio = false);
+    SourceStamp? Source = null, int Rotation = 0, bool NormalizeAudio = false, bool SmoothLoop = false);
 
 internal static class OutputNames
 {
@@ -56,9 +56,9 @@ internal static class OutputNames
     }
 
     public static string Clip(MediaInfo media, double start, double end, int? audio, int? subtitle,
-        bool copy, bool burnSubtitle, string extension, int rotation = 0, bool normalizeAudio = false)
+        bool copy, bool burnSubtitle, string extension, int rotation = 0, bool normalizeAudio = false, bool smoothLoop = false)
     {
-        var mode = (copy ? "copy" : "precise") + (normalizeAudio ? "_loud14" : "");
+        var mode = (copy ? "copy" : "precise") + (normalizeAudio ? "_loud14" : "") + (smoothLoop ? "_smooth" : "");
         var a = audio is null ? "mute" : $"a{audio}";
         var s = burnSubtitle ? $"burn{subtitle?.ToString(CultureInfo.InvariantCulture) ?? "none"}" : "suboff";
         var rotationKey = rotation == 0 ? "" : $"|rot{rotation}";
@@ -106,6 +106,7 @@ internal static class Exporter
     public static async Task<MediaInfo> VerifyAsync(ExportSpec spec, string path, CancellationToken cancellation)
     {
         spec = await PrepareAsync(spec, cancellation);
+        if (!spec.Media.HasVideo) return await AudioEditing.VerifyAsync(spec, path, cancellation);
         var sourceStamp = SourceStamp.Capture(spec.Media.Path);
         if (!File.Exists(path) || new FileInfo(path).Length == 0)
             throw new InvalidOperationException("导出文件不存在或为空。");
@@ -154,7 +155,7 @@ internal static class Exporter
         if (spec.Copy && spec.BurnSubtitle) throw new InvalidOperationException("纯复制无法画入字幕。");
         if (spec.AudioIndex is not null && !spec.Media.Audio.Any(a => a.Index == spec.AudioIndex))
             throw new InvalidOperationException("找不到所选音轨。");
-        if (spec.Copy)
+        if (spec.Copy && spec.Media.HasVideo)
         {
             var key = spec.CopyKeyframe ?? (await Probe.ReadKeyframesAsync(spec.Media.Path, cancellation))
                 .LastOrDefault(k => k.Position <= spec.Start + 0.000001);
@@ -168,6 +169,11 @@ internal static class Exporter
     public static async Task<MediaInfo> RunAsync(ExportSpec spec, CancellationToken cancellation)
     {
         spec = await PrepareAsync(spec, cancellation);
+        if (!spec.Media.HasVideo)
+        {
+            if (File.Exists(spec.OutputPath)) return await AudioEditing.VerifyAsync(spec, spec.OutputPath, cancellation);
+            return await AudioEditing.ExportAsync(spec, cancellation);
+        }
         var exe = ToolPaths.Find("ffmpeg") ?? throw new InvalidOperationException("找不到 ffmpeg。");
         var extension = Path.GetExtension(spec.OutputPath);
         var temporary = Path.Combine(Path.GetDirectoryName(spec.OutputPath)!,
