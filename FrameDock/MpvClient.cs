@@ -28,11 +28,9 @@ internal sealed class MpvClient : IAsyncDisposable
     private readonly Task readLoop;
     private int nextRequest;
     private double timelineOrigin;
-    private double loopStart;
-    private double loopDuration;
-    private double MapPosition(double time) => loopDuration > 0
-        ? loopStart + Math.Max(0, time) % loopDuration : time - timelineOrigin;
-    public void SetLoopTimeline(double start, double duration) { loopStart = start; loopDuration = duration; }
+    private double? rangeLoopStart;
+    private double? rangeLoopEnd;
+    private double MapPosition(double time) => time - timelineOrigin;
 
     public event Action<double>? PositionChanged;
     public event Action<bool>? PauseChanged;
@@ -142,7 +140,7 @@ internal sealed class MpvClient : IAsyncDisposable
 
     public async Task LoadAsync(string path, double origin = 0)
     {
-        loopDuration = 0;
+        await SetRangeLoopAsync(null, null);
         timelineOrigin = origin;
         await RestartPlaybackAsync("loadfile", path, "replace");
         PositionChanged?.Invoke((await PropertyAsync("time-pos")).GetDouble());
@@ -150,10 +148,15 @@ internal sealed class MpvClient : IAsyncDisposable
     public Task PauseAsync(bool pause) => CommandAsync("set_property", "pause", pause);
     public async Task SetRangeLoopAsync(double? start, double? end)
     {
+        // Reapplying the same A/B points can disturb mpv's pending loop seek after a scrub.
+        // Resume playback without changing the active range.
+        if (rangeLoopStart == start && rangeLoopEnd == end) return;
         // Clear B first so changing A cannot temporarily create an invalid loop.
         await CommandAsync("set_property", "ab-loop-b", "no");
         await CommandAsync("set_property", "ab-loop-a", start is double a ? (object)(a + timelineOrigin) : "no");
         await CommandAsync("set_property", "ab-loop-b", end is double b ? (object)(b + timelineOrigin) : "no");
+        rangeLoopStart = start;
+        rangeLoopEnd = end;
     }
     public Task SeekAsync(double seconds) => RestartPlaybackAsync("seek", seconds + timelineOrigin, "absolute+exact");
     public Task JumpAsync(double seconds) => RestartPlaybackAsync("seek", seconds, "relative+exact");

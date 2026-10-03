@@ -661,104 +661,184 @@ internal static class Program
             Check(Math.Abs(BitConverter.ToSingle(bytes, 0)) < 0.001 && Math.Abs(BitConverter.ToSingle(bytes, bytes.Length - 4)) < 0.01,
                 "seam smoothing removes endpoint discontinuity in the exported waveform");
         }
-        await CheckLoop(false);
-        await CallAsync(form, "SeekAsync", 0.5d);
-        Check(Field<LoopPreview?>(form, "bufferedLoop") is null && Near((await Field<MpvClient>(form, "player").PropertyAsync("time-pos")).GetDouble(), 0.5, 0.04),
-            "scrubbing restores the original source timeline");
-        Field<CheckBox>(form, "loopRange").Checked = false;
-        await CallAsync(form, "UpdateRangeLoopAsync", false);
+        await CheckLoop();
         var videoPath = Path.Combine(scratch, "video.mp4");
         await AudioEditing.RunFfmpegAsync(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=4",
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4", "-c:v", "libx264", "-g", "120", "-c:a", "aac", videoPath], default);
         await CallAsync(form, "OpenVideoAsync", videoPath);
-        await CheckLoop(true);
-        await CallAsync(form, "SeekAsync", 0.4d);
-        // Decode eight fractional-length laps and verify exact audio boundaries and video count.
-        using (var fractional = await LoopPreview.CreateAsync(Field<MediaInfo>(form, "media"), 0.4, 0.901234, 1, null, 0, true, default))
-        {
-            var repeated = Path.Combine(scratch, "repeated.wav");
-            await AudioEditing.RunFfmpegAsync(["-v", "error", "-y", "-i", fractional.Path,
-                "-af", $"aloop=loop=7:size={fractional.Samples}:start=0,atrim=end_sample={fractional.Samples * 8}",
-                "-vn", "-ac", "2", "-c:a", "pcm_s16le", repeated], default);
-            using var decoder = MediaProcess.Start("ffmpeg", ["-v", "error", "-i", repeated, "-f", "s16le", "-"]);
-            var errors = decoder.StandardError.ReadToEndAsync();
-            using var output = new MemoryStream();
-            await decoder.StandardOutput.BaseStream.CopyToAsync(output);
-            await decoder.WaitForExitAsync();
-            var pcm = output.ToArray();
-            var cycleBytes = (int)fractional.Samples * 4;
-            Check(pcm.Length == cycleBytes * 8 && Enumerable.Range(1, 7).All(cycle =>
-                pcm.AsSpan(0, cycleBytes).SequenceEqual(pcm.AsSpan(cycle * cycleBytes, cycleBytes))),
-                "eight non-frame-aligned audio laps are sample-identical with no missing or inserted samples: " + await errors);
-        }
-        Field<ComboBox>(form, "audio").SelectedIndex = 0;
-        await WaitUntilAsync(() => Field<LoopPreview?>(form, "bufferedLoop") is { HasAudio: false } && Field<CancellationTokenSource?>(form, "loopBuild") is null, 15000);
-        await CallAsync(form, "UpdateRangeLoopAsync", true);
-        Check(Field<LoopPreview?>(form, "bufferedLoop") is { HasAudio: false, Frames: > 0 }, "silent video loops use the continuous video clock");
-        await Task.Delay(1400);
-        Check((await Field<MpvClient>(form, "player").CommandAsync("get_property", "time-pos")).GetDouble() > 1,
-            "silent video keeps playing beyond its selected end");
-        Field<ComboBox>(form, "audio").SelectedIndex = 1;
-        await WaitUntilAsync(() => Field<LoopPreview?>(form, "bufferedLoop") is { HasAudio: true } && Field<CancellationTokenSource?>(form, "loopBuild") is null, 15000);
-        await CallAsync(form, "UpdateRangeLoopAsync", true);
-        // Rapid range edits must cancel stale decoders and settle on the final range.
-        bar.Start = 0.1; bar.End = 0.7; bar.Start = 0.2; bar.End = 0.8;
-        await CallAsync(form, "UpdateRangeLoopAsync", true);
-        Check(Near(Field<LoopPreview>(form, "bufferedLoop").Start, 0.2), "rapid edits leave only the latest buffered selection");
+        await CheckLoop();
+        var client = Field<MpvClient>(form, "player");
+        var audioSelector = Field<ComboBox>(form, "audio");
+        audioSelector.SelectedIndex = 0;
+        await CallAsync(form, "SelectTrackAsync", "aid", audioSelector);
+        Check((await client.PropertyAsync("aid")).ValueKind == JsonValueKind.False && (await client.PropertyAsync("pause")).GetBoolean(),
+            "disabling audio preserves paused loop playback");
+        await CallAsync(form, "SeekAsync", 0.65d);
+        bar.End = 0.9;
+        await CallAsync(form, "TogglePauseAsync");
+        await CheckWraps(client, "silent video");
+        await client.PauseAsync(true);
+        audioSelector.SelectedIndex = 1;
+        await CallAsync(form, "SelectTrackAsync", "aid", audioSelector);
+        Check((await client.PropertyAsync("aid")).ValueKind == JsonValueKind.Number && (await client.PropertyAsync("pause")).GetBoolean(),
+            "switching audio back preserves pause and source playback");
+        await CallAsync(form, "SeekAsync", 0.65d);
         await CallAsync(form, "HandleShortcutAsync", Keys.Right, false);
-        Check(Field<LoopPreview?>(form, "bufferedLoop") is null, "frame stepping leaves buffered playback and uses the original video");
+        Check(Field<CheckBox>(form, "loopRange").Checked && (await client.PropertyAsync("pause")).GetBoolean() &&
+            (await client.PropertyAsync("time-pos")).GetDouble() > 0.65,
+            "frame stepping advances the original video while retaining loop mode");
         await CallAsync(form, "SelectCoverAsync");
         using (var image = Image.FromStream(new MemoryStream((byte[])Field<object>(form, "selectedCover").GetType().GetProperty("Png")!.GetValue(Field<object>(form, "selectedCover"))!)))
-            Check(image.Width == 320 && image.Height == 180, "covers retain source resolution after loop playback");
-        Field<CheckBox>(form, "loopRange").Checked = true;
-        await CallAsync(form, "UpdateRangeLoopAsync", true);
-        var temp = Field<LoopPreview>(form, "bufferedLoop").Path;
+            Check(image.Width == 320 && image.Height == 180, "covers retain source resolution during loop playback");
+        var savedPosition = (await client.PropertyAsync("time-pos")).GetDouble();
         form.Close();
         await WaitUntilAsync(() => Field<Task?>(form, "releasingPlayer") is null, 15000);
-        Check(!File.Exists(temp) && Field<MpvClient?>(form, "player") is null, "tray teardown deletes loop buffers and releases the player");
+        Check(Field<MpvClient?>(form, "player") is null && CanOpenExclusively(videoPath),
+            "tray teardown releases the player and source handle");
         await CallAsync(form, "ShowFromTrayAsync");
-        Check(Field<LoopPreview?>(form, "bufferedLoop") is not null, "tray reopen restores the selection's buffered loop paused");
+        client = Field<MpvClient>(form, "player");
+        Check(Field<CheckBox>(form, "loopRange").Checked && (await client.PropertyAsync("pause")).GetBoolean() &&
+            Near((await client.PropertyAsync("time-pos")).GetDouble(), savedPosition, 0.04),
+            "tray reopen restores the original pointer and loop mode paused");
+        await CheckPoints(client);
         TestVisualLayout(form);
 
-        async Task CheckLoop(bool hasVideo)
+        // Native A/B points must use the same source timestamp origin as seeking.
+        var offsetPath = Path.Combine(scratch, "offset.mkv");
+        await AudioEditing.RunFfmpegAsync(["-v", "error", "-y", "-i", videoPath, "-map", "0", "-c", "copy", "-output_ts_offset", "5", offsetPath], default);
+        await CallAsync(form, "OpenVideoAsync", offsetPath);
+        Check(Field<MediaInfo>(form, "media").TimelineOrigin > 4.9, "offset source exposes a nonzero timeline origin");
+        await CheckLoop();
+
+        // A long selection needs no pre-render or decoded copy of the entire range.
+        var longAudio = Path.Combine(scratch, "long.flac");
+        await AudioEditing.RunFfmpegAsync(["-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "610", "-c:a", "flac", longAudio], default);
+        await CallAsync(form, "OpenVideoAsync", longAudio);
+        bar.Start = 2; bar.End = 609;
+        await CallAsync(form, "SeekAsync", 450d);
+        await CallAsync(form, "UpdateRangeLoopAsync", false);
+        client = Field<MpvClient>(form, "player");
+        Check((await client.PropertyAsync("pause")).GetBoolean() && Near((await client.PropertyAsync("time-pos")).GetDouble(), 450, 0.04) &&
+            (await client.PropertyAsync("path")).GetString() == longAudio,
+            "selections over ten minutes retain their middle pointer and play the original source");
+        await CheckPoints(client);
+        await CallAsync(form, "TogglePauseAsync");
+        Check(!(await client.PropertyAsync("pause")).GetBoolean() && (await client.PropertyAsync("time-pos")).GetDouble() >= 449.96,
+            "a long loop starts in the middle without a pre-render");
+        await client.PauseAsync(true);
+
+        async Task CheckLoop()
         {
+            var target = Field<MpvClient>(form, "player");
+            var mode = Field<CheckBox>(form, "loopRange");
+            await target.PauseAsync(true);
             bar.Start = 0.4; bar.End = 0.9;
-            Field<CheckBox>(form, "loopRange").Checked = true;
-            await CallAsync(form, "UpdateRangeLoopAsync", true);
-            var client = Field<MpvClient>(form, "player");
-            Check(Field<LoopPreview?>(form, "bufferedLoop") is not null, "loop starts: " + Field<Label>(form, "status").Text);
-            var prepared = Field<LoopPreview>(form, "bufferedLoop");
-            Check((prepared.Frames > 0) == hasVideo && prepared.Samples == 24000, "buffered loop preserves half-second audio/video period");
-            var seeks = 0; var ends = 0;
-            void Event(string name) { if (name == "seek") seeks++; if (name == "end-file") ends++; }
-            client.PlaybackEvent += Event;
+            await CallAsync(form, "SeekAsync", 0.65d);
+            var loads = 0;
+            void Event(string name) { if (name == "start-file") Interlocked.Increment(ref loads); }
+            target.PlaybackEvent += Event;
             try
             {
-                var clock = Stopwatch.StartNew();
-                var previous = (await client.CommandAsync("get_property", "time-pos")).GetDouble();
-                var origin = previous;
-                var maxLag = 0d;
-                var wraps = 0;
-                var backwards = false;
-                var mappedPrevious = (await client.PropertyAsync("time-pos")).GetDouble();
-                while (clock.Elapsed.TotalSeconds < 4)
-                {
-                    await Task.Delay(35);
-                    var raw = (await client.CommandAsync("get_property", "time-pos")).GetDouble();
-                    var mapped = (await client.PropertyAsync("time-pos")).GetDouble();
-                    backwards |= raw < previous - 0.001;
-                    maxLag = Math.Max(maxLag, clock.Elapsed.TotalSeconds - (raw - origin));
-                    if (mapped < mappedPrevious - 0.1) wraps++;
-                    previous = raw; mappedPrevious = mapped;
-                }
-                Check(!backwards && seeks == 0 && ends == 0 && wraps >= 6 && maxLag < 0.18,
-                    $"{(hasVideo ? "video+audio" : "audio")} crosses {wraps} seams without seek/EOF or cumulative stalls (max lag {maxLag:F3}s)");
-                await client.PauseAsync(true);
-                var frozen = (await client.CommandAsync("get_property", "time-pos")).GetDouble();
-                await Task.Delay(180);
-                Check(Near((await client.CommandAsync("get_property", "time-pos")).GetDouble(), frozen, 0.04), "space-style pause freezes the buffered clock");
+                mode.Checked = true;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                Check((await target.PropertyAsync("pause")).GetBoolean() && Near((await target.PropertyAsync("time-pos")).GetDouble(), 0.65, 0.04),
+                    "enabling loop mode retains the middle pointer and pause state");
+                await CheckPoints(target);
+                await CallAsync(form, "TogglePauseAsync");
+                Check(!(await target.PropertyAsync("pause")).GetBoolean() && Near((await target.PropertyAsync("time-pos")).GetDouble(), 0.65, 0.1),
+                    "space starts loop playback at the middle pointer");
+                await CheckWraps(target, Field<MediaInfo>(form, "media").HasVideo ? "video + audio" : "audio");
+                bar.FitSelection();
+                int PointerX(double time) => 18 + (int)Math.Round((bar.Width - 36) * (time - bar.ViewStart) / bar.ViewLength);
+                Call(bar, "OnMouseDown", new MouseEventArgs(MouseButtons.Left, 1, PointerX(0.6), 55, 0));
+                Call(bar, "OnMouseMove", new MouseEventArgs(MouseButtons.Left, 0, PointerX(0.7), 55, 0));
+                Call(bar, "OnMouseUp", new MouseEventArgs(MouseButtons.Left, 1, PointerX(0.7), 55, 0));
+                await Field<Task>(form, "seekPump");
+                Check(mode.Checked && (await target.PropertyAsync("pause")).GetBoolean() && Near((await target.PropertyAsync("time-pos")).GetDouble(), 0.7, 0.04),
+                    "scrubbing pauses at the requested frame and retains loop mode");
+                await CheckPoints(target);
+                await CallAsync(form, "TogglePauseAsync");
+                var resumed = (await target.PropertyAsync("time-pos")).GetDouble();
+                Check(Near(resumed, 0.7, 0.1), $"space resumes from the scrubbed middle pointer (actual {resumed:F3})");
+                // Check pause away from an automatic boundary seek and after the audio clock has started.
+                bar.End = 3;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                await Task.Delay(100);
+                await CallAsync(form, "TogglePauseAsync");
+                await Task.Delay(100);
+                var frozen = (await target.PropertyAsync("time-pos")).GetDouble();
+                await Task.Delay(150);
+                var stillPaused = (await target.PropertyAsync("time-pos")).GetDouble();
+                Check((await target.PropertyAsync("pause")).GetBoolean() && Near(stillPaused, frozen, 0.04),
+                    $"space pauses the source clock ({frozen:F3} -> {stillPaused:F3})");
+                await CallAsync(form, "SeekAsync", 2d);
+                bar.End = 1.2;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                Check((await target.PropertyAsync("pause")).GetBoolean() && Near((await target.PropertyAsync("time-pos")).GetDouble(), 2, 0.04),
+                    "editing a paused boundary preserves the pointer even outside the new selection");
+                await CallAsync(form, "TogglePauseAsync");
+                var entered = (await target.PropertyAsync("time-pos")).GetDouble();
+                Check(Near(entered, bar.Start, 0.1),
+                    $"resuming from outside the selection enters the loop at its start (actual {entered:F3})");
+                await target.PauseAsync(true);
+                bar.End = 3;
+                await CallAsync(form, "SeekAsync", 1.5d);
+                await CallAsync(form, "TogglePauseAsync");
+                var beforeEdit = (await target.PropertyAsync("time-pos")).GetDouble();
+                bar.Start = 0.8; bar.End = 3.5;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                var afterEdit = (await target.PropertyAsync("time-pos")).GetDouble();
+                Check(!(await target.PropertyAsync("pause")).GetBoolean() && afterEdit >= beforeEdit - 0.04 && afterEdit < beforeEdit + 0.3,
+                    "in-range boundary edits preserve running playback and its position");
+                bar.End = 1.2;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                Check(!(await target.PropertyAsync("pause")).GetBoolean() && Near((await target.PropertyAsync("time-pos")).GetDouble(), bar.Start, 0.1),
+                    "a boundary edit excluding a running pointer enters the new loop without pausing");
+                await target.PauseAsync(true);
+                bar.Start = 0.1; bar.End = 0.7; bar.Start = 0.2; bar.End = 0.8;
+                mode.Checked = false; mode.Checked = true;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                await CheckPoints(target);
+                bar.Start = 0.4; bar.End = 3;
+                await CallAsync(form, "SeekAsync", 1.5d);
+                await CallAsync(form, "PreviewRangeAsync");
+                Check(Near((await target.PropertyAsync("time-pos")).GetDouble(), bar.Start, 0.1), "R explicitly auditions from the selection start");
+                var beforeDisable = (await target.PropertyAsync("time-pos")).GetDouble();
+                mode.Checked = false;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                Check(!(await target.PropertyAsync("pause")).GetBoolean() && (await target.PropertyAsync("time-pos")).GetDouble() >= beforeDisable - 0.04 &&
+                    (await target.PropertyAsync("ab-loop-a")).GetString() == "no" && (await target.PropertyAsync("ab-loop-b")).GetString() == "no",
+                    "disabling the loop clears both points without pausing or resetting playback");
+                await target.PauseAsync(true);
+                mode.Checked = true;
+                await CallAsync(form, "UpdateRangeLoopAsync", false);
+                Check(loads == 0 && (await target.PropertyAsync("path")).GetString() == Field<MediaInfo>(form, "media").Path,
+                    "looping, scrubbing, boundary edits and toggles never reload or replace the source");
             }
-            finally { client.PlaybackEvent -= Event; }
+            finally { target.PlaybackEvent -= Event; }
+        }
+
+        async Task CheckPoints(MpvClient target)
+        {
+            var origin = Field<MediaInfo>(form, "media").TimelineOrigin;
+            Check(Near((await target.PropertyAsync("ab-loop-a")).GetDouble(), bar.Start + origin) &&
+                Near((await target.PropertyAsync("ab-loop-b")).GetDouble(), bar.End + origin),
+                "the active source loop matches the latest selection and timeline origin");
+        }
+
+        async Task CheckWraps(MpvClient target, string kind)
+        {
+            var wraps = 0;
+            var previous = (await target.PropertyAsync("time-pos")).GetDouble();
+            var clock = Stopwatch.StartNew();
+            while (clock.Elapsed.TotalSeconds < 4 && wraps < 3)
+            {
+                await Task.Delay(25);
+                var current = (await target.PropertyAsync("time-pos")).GetDouble();
+                if (current < previous - 0.1) wraps++;
+                previous = current;
+            }
+            Check(wraps >= 3 && !(await target.PropertyAsync("pause")).GetBoolean(), kind + " repeatedly returns to the selected start");
         }
     }
 

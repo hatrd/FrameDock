@@ -67,12 +67,11 @@ internal sealed class MainForm : Form
     private bool capturingCover;
     private bool submittingExport;
     private bool previewingRange;
-    private readonly CheckBox loopRange = new() { Text = "选区循环", Appearance = Appearance.Button, AutoSize = true,
-        Height = 30, Margin = new Padding(2), TextAlign = ContentAlignment.MiddleCenter,
+    private readonly CheckBox loopRange = new() { Text = "选区循环", Appearance = Appearance.Button,
+        Size = new Size(88, 34), Margin = new Padding(2), TextAlign = ContentAlignment.MiddleCenter,
         FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(43, 49, 59), ForeColor = Color.White };
     private readonly SemaphoreSlim loopRangeLock = new(1, 1);
-    private LoopPreview? bufferedLoop;
-    private CancellationTokenSource? loopBuild;
+    private int loopRevision;
     private CancellationTokenSource? audioAnalysis;
     private Task audioAnalysisTask = Task.CompletedTask;
     private CancellationTokenSource? beatAnalysis;
@@ -141,7 +140,7 @@ internal sealed class MainForm : Form
         trimControls.Controls.AddRange([setStart, setEnd, preview, loopRange, fit, overview, reset]);
         tips.SetToolTip(setStart, "暂停在当前画面，把左边界设到播放指针（[）。Home 或 Shift+[ 跳到当前起点。");
         tips.SetToolTip(setEnd, "暂停在当前画面，把右边界设到播放指针（]）。End 或 Shift+] 跳到当前终点。");
-        tips.SetToolTip(loopRange, "开启后从选区起点循环播放；修改选区会更新循环范围。空格可暂停，再次点击关闭循环。");
+        tips.SetToolTip(loopRange, "从当前指针播放，到选区终点回到起点。拖动指针和修改边界保留循环模式；空格播放 / 暂停，R 从起点试听。");
         tips.SetToolTip(range, "上方绿/橙手柄拖边界，下方白色指针拖播放位置。滚轮缩放；Shift+滚轮或右键拖动平移；底部总览定位视角。");
 
         var open = Button("打开媒体", async () => await PickVideoAsync());
@@ -371,7 +370,9 @@ internal sealed class MainForm : Form
         range.RangeChanged += async () => await UpdateRangeLoopAsync();
         loopRange.CheckedChanged += async (_, _) => {
             loopRange.BackColor = loopRange.Checked ? StudioTheme.Selection : StudioTheme.Raised;
-            await UpdateRangeLoopAsync(startPlayback: loopRange.Checked);
+            if (player is not null && !loading)
+                SetStatus(loopRange.Checked ? "选区循环已开启；空格从当前指针播放，R 从起点试听。" : "选区循环已关闭。");
+            await UpdateRangeLoopAsync();
         };
         normalizeAudio.CheckedChanged += (_, _) => { SaveSettings(); UpdateRange(); };
         showWaveform.CheckedChanged += async (_, _) => {
@@ -546,7 +547,7 @@ internal sealed class MainForm : Form
             return;
         }
         loading = true;
-        loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
+        loopRevision++; audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
         await seekPump;
         await previewLifecycle.WaitAsync();
         try
@@ -556,7 +557,6 @@ internal sealed class MainForm : Form
             keyframeScan?.Cancel();
             await keyframeScanTask;
             if (player is not null) { await player.DisposeAsync(); player = null; }
-            bufferedLoop?.Dispose(); bufferedLoop = null;
             await audioAnalysisTask; await beatAnalysisTask;
             var info = await Probe.ReadAsync(path);
             media = info;
@@ -684,9 +684,8 @@ internal sealed class MainForm : Form
         if (loading || player is null || selector.SelectedItem is not TrackOption choice) return;
         try
         {
-            loopBuild?.Cancel();
             await previewLifecycle.WaitAsync();
-            try { await RestoreSourceAsync(); await player.SetTrackAsync(property, choice.Index); }
+            try { if (player is not null) await player.SetTrackAsync(property, choice.Index); }
             finally { previewLifecycle.Release(); }
             if (property == "aid")
             {
@@ -717,7 +716,6 @@ internal sealed class MainForm : Form
         try
         {
             await seekPump;
-            await RestoreSourceAsync();
             previewingRange = false;
             var next = (rotation + delta + 360) % 360;
             await ApplyRotationAsync(player, next);
@@ -740,7 +738,7 @@ internal sealed class MainForm : Form
 
     private Task SeekAsync(double time)
     {
-        if (player is null || loading) return Task.CompletedTask;
+        if (player is null || loading || capturingCover) return Task.CompletedTask;
         previewingRange = false;
         pendingSeek = Math.Clamp(time, 0, range.Duration);
         if (seekPump.IsCompleted) seekPump = PumpSeekAsync();
@@ -751,12 +749,10 @@ internal sealed class MainForm : Form
     {
         var target = player;
         if (target is null) return;
+        await previewLifecycle.WaitAsync();
         try
         {
-            loopBuild?.Cancel();
-            await previewLifecycle.WaitAsync();
-            try { await RestoreSourceAsync(); }
-            finally { previewLifecycle.Release(); }
+            if (player != target || loading || !Visible) return;
             await target.PauseAsync(true);
             while (pendingSeek is double time && player == target)
             {
@@ -770,7 +766,7 @@ internal sealed class MainForm : Form
             }
         }
         catch (Exception error) { SetStatus(error.Message); }
-        finally { pendingSeek = null; }
+        finally { pendingSeek = null; previewLifecycle.Release(); }
     }
 
     private async Task SetBoundaryAsync(bool isStart)
@@ -801,9 +797,9 @@ internal sealed class MainForm : Form
         if (player is null || loading) return;
         try
         {
-            if (loopRange.Checked) { await UpdateRangeLoopAsync(true); return; }
             await SeekAsync(range.Start);
             range.EnsureVisible(range.Start);
+            if (loopRange.Checked) { await UpdateRangeLoopAsync(true); return; }
             previewingRange = !loopRange.Checked;
             await player.PauseAsync(false);
             SetStatus(loopRange.Checked ? "正在循环播放选区。空格可随时暂停。" : "正在试听所选片段，到终点自动暂停。空格可随时暂停。");
@@ -823,71 +819,48 @@ internal sealed class MainForm : Form
         var target = player;
         var source = media;
         if (target is null || source is null || loading) return;
-        loopBuild?.Cancel();
-        var build = new CancellationTokenSource();
-        loopBuild = build;
+        var revision = ++loopRevision;
         await loopRangeLock.WaitAsync();
-        var lifecycleHeld = false;
-        LoopPreview? prepared = null;
+        await previewLifecycle.WaitAsync();
         try
         {
-            await Task.Delay(180, build.Token); // Coalesce handle motion instead of decoding every mouse event.
-            await previewLifecycle.WaitAsync(build.Token); lifecycleHeld = true;
-            if (player != target || media != source || loading || !Visible) return;
-            var paused = (await target.PropertyAsync("pause")).GetBoolean();
-            await RestoreSourceAsync();
-            if (!loopRange.Checked) return;
-            previewingRange = false;
-            SetStatus("正在缓冲无缝循环选段…");
-            prepared = await LoopPreview.CreateAsync(source, range.Start, range.End,
-                (audio.SelectedItem as TrackOption)?.Index, (subtitle.SelectedItem as TrackOption)?.Index,
-                rotation, true, build.Token);
-            build.Token.ThrowIfCancellationRequested();
-            bufferedLoop = prepared; prepared = null;
-            await target.PauseAsync(true);
-            await target.CommandAsync("vf", "clr", "");
-            await target.CommandAsync("set_property", "lavfi-complex", bufferedLoop.Graph);
-            await target.LoadAsync(bufferedLoop.Path);
-            target.SetLoopTimeline(bufferedLoop.Start, bufferedLoop.Duration);
-            lastPosition = range.Position = range.Start;
-            range.EnsureVisible(range.Start); UpdatePosition();
-            await target.PauseAsync(startPlayback ? false : paused);
-            SetStatus("选区已缓冲，连续无缝循环；空格暂停，拖动指针返回源媒体。" + (source.HasVideo ? " 循环预览适配分辨率，导出保持原分辨率。" : ""));
+            if (revision != loopRevision || player != target || media != source || loading || !Visible) return;
+            var enabled = loopRange.Checked;
+            var start = range.Start;
+            var end = range.End;
+            // A loop changes source playback boundaries, never loads a second copy of the media.
+            // Read the latest range after acquiring the locks so rapid handle edits cannot win out of order.
+            await target.SetRangeLoopAsync(enabled ? start : null, enabled ? end : null);
+            if (revision != loopRevision) return;
+            if (enabled)
+            {
+                previewingRange = false;
+                var paused = (await target.PropertyAsync("pause")).GetBoolean();
+                var position = (await target.PropertyAsync("time-pos")).GetDouble();
+                if (revision != loopRevision) return;
+                // Paused editing may inspect any source frame. Constrain to the range only when playing;
+                // an in-range pointer resumes in the middle, including after scrubbing or changing boundaries.
+                if ((startPlayback || !paused) && (position < start || position >= end))
+                {
+                    await target.SeekAsync(start);
+                    lastPosition = range.Position = (await target.PropertyAsync("time-pos")).GetDouble();
+                    range.EnsureVisible(lastPosition); UpdatePosition();
+                }
+                if (revision != loopRevision) return;
+                if (startPlayback) await target.PauseAsync(false);
+            }
+            if (enabled && startPlayback) SetStatus("正在循环播放选区；空格暂停，拖动指针可重新定位。");
         }
-        catch (OperationCanceledException) { }
         catch (Exception error)
         {
-            if (player == target)
-            {
-                try { await RestoreSourceAsync(); }
-                catch (Exception restoreError) { SetStatus("恢复源媒体失败：" + restoreError.Message + "；请重新打开文件。"); return; }
-                SetStatus("循环播放失败：" + error.Message + "；请关闭循环后重试。");
-            }
+            if (player == target && revision == loopRevision)
+                SetStatus("更新选区循环失败：" + error.Message + "；请关闭循环后重试，或重新打开媒体。");
         }
         finally
         {
-            prepared?.Dispose();
-            if (lifecycleHeld) previewLifecycle.Release();
+            previewLifecycle.Release();
             loopRangeLock.Release();
-            if (loopBuild == build) loopBuild = null;
-            build.Dispose();
         }
-    }
-
-    private async Task RestoreSourceAsync()
-    {
-        if (bufferedLoop is null || player is null || media is null) return;
-        var previous = bufferedLoop;
-        var position = (await player.PropertyAsync("time-pos")).GetDouble();
-        await player.PauseAsync(true);
-        await player.CommandAsync("set_property", "lavfi-complex", "");
-        await player.LoadAsync(media.Path, media.TimelineOrigin);
-        bufferedLoop = null; previous.Dispose();
-        await player.SetTrackAsync("aid", (audio.SelectedItem as TrackOption)?.Index);
-        await player.SetTrackAsync("sid", (subtitle.SelectedItem as TrackOption)?.Index);
-        if (!media.HasVideo) await player.CommandAsync("set_property", "vid", "no");
-        if (rotation != 0) await ApplyRotationAsync(player, rotation);
-        await player.SeekAsync(position);
     }
 
     private async Task AnalyzeAudioAsync()
@@ -979,13 +952,13 @@ internal sealed class MainForm : Form
         if (player is null) return;
         try
         {
+            await seekPump;
             var paused = await player.PropertyAsync("pause");
             previewingRange = false;
             if (paused.GetBoolean() && loopRange.Checked)
             {
-                if (bufferedLoop is null) { await UpdateRangeLoopAsync(true); return; }
-                var position = (await player.PropertyAsync("time-pos")).GetDouble();
-                if (position < range.Start || position >= range.End) await SeekAsync(range.Start);
+                await UpdateRangeLoopAsync(true);
+                return;
             }
             await player.PauseAsync(!paused.GetBoolean());
         }
@@ -1022,13 +995,6 @@ internal sealed class MainForm : Form
         try
         {
             await seekPump;
-            if (key is Keys.H or Keys.Left or Keys.L or Keys.Right or Keys.J or Keys.Down or Keys.K or Keys.Up)
-            {
-                loopBuild?.Cancel();
-                await previewLifecycle.WaitAsync();
-                try { await RestoreSourceAsync(); }
-                finally { previewLifecycle.Release(); }
-            }
             switch (key)
             {
                 case Keys.Space: await TogglePauseAsync(); break;
@@ -1071,7 +1037,6 @@ internal sealed class MainForm : Form
     private async Task<CoverFrame?> CaptureCoverAsync()
     {
         if (player is null || media?.HasVideo != true || loading || capturingCover || rotating) return null;
-        loopBuild?.Cancel();
         capturingCover = true;
         await seekPump;
         await previewLifecycle.WaitAsync();
@@ -1087,7 +1052,6 @@ internal sealed class MainForm : Form
         try
         {
             await seekPump;
-            await RestoreSourceAsync();
             previewingRange = false;
             await target.PauseAsync(true);
             var stamp = SourceStamp.Capture(source.Path);
@@ -1384,7 +1348,7 @@ internal sealed class MainForm : Form
     private async Task HideToTrayAsync()
     {
         Hide();
-        loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
+        loopRevision++; audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
         previewingRange = false;
         keyframeScan?.Cancel();
         var release = releasingPlayer ??= ReleasePreviewAsync();
@@ -1414,7 +1378,6 @@ internal sealed class MainForm : Form
                 player = null;
                 await previous.DisposeAsync();
             }
-            bufferedLoop?.Dispose(); bufferedLoop = null;
             range.Waveform = null;
         }
         finally { previewLifecycle.Release(); }
@@ -1424,7 +1387,7 @@ internal sealed class MainForm : Form
     {
         if (runningJobs.Count + waiting.Count == 0)
         {
-            loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
+            loopRevision++; audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
             await ReleasePreviewAsync();
             ExitNow(); return;
         }
@@ -1456,7 +1419,7 @@ internal sealed class MainForm : Form
         SaveWindowSettings();
         exiting = true;
         keyframeScan?.Cancel();
-        loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
+        loopRevision++; audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
         tray.Visible = false;
         tray.Dispose();
         _ = ReleasePreviewAsync();
