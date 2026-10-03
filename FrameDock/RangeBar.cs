@@ -55,7 +55,7 @@ internal sealed class RangeBar : Control
         TabStop = true;
         Height = 90;
         Cursor = Cursors.Hand;
-        BackColor = Color.FromArgb(24, 27, 32);
+        BackColor = StudioTheme.Canvas;
         edgeScroll.Tick += (_, _) => {
             if (dragging is not (DragTarget.Start or DragTarget.End or DragTarget.Play)) return;
             var direction = lastMouseX <= PaddingX ? -1 : lastMouseX >= Width - PaddingX ? 1 : 0;
@@ -104,21 +104,25 @@ internal sealed class RangeBar : Control
         base.OnPaint(e);
         var g = e.Graphics;
         g.Clear(BackColor);
-        using var baseBrush = new SolidBrush(Color.FromArgb(67, 73, 82));
-        using var selectedBrush = new SolidBrush(Color.FromArgb(58, 146, 225));
-        using var startBrush = new SolidBrush(Color.FromArgb(101, 220, 167));
-        using var endBrush = new SolidBrush(Color.FromArgb(250, 169, 89));
+        using var baseBrush = new SolidBrush(StudioTheme.Border);
+        using var selectedBrush = new SolidBrush(StudioTheme.Accent);
+        using var startBrush = new SolidBrush(StudioTheme.Start);
+        using var endBrush = new SolidBrush(StudioTheme.End);
         using var playPen = new Pen(Color.White, 2);
+        using var gridPen = new Pen(StudioTheme.Raised);
+        using var overviewPen = new Pen(StudioTheme.Muted);
+        using var wash = new SolidBrush(StudioTheme.Selection);
         var rulerStep = TickStep(viewLength / Math.Max(2, TrackWidth / 100));
         for (var t = Math.Ceiling(viewStart / rulerStep) * rulerStep; t <= viewStart + viewLength; t += rulerStep)
         {
             var x = X(t);
-            g.DrawLine(Pens.DimGray, x, 16, x, Center + 8);
-            TextRenderer.DrawText(g, TickLabel(t, rulerStep), Font, new Point(Math.Clamp(x - 25, 0, Math.Max(0, Width - 65)), 0), Color.Silver);
+            g.DrawLine(gridPen, x, 16, x, Center + 8);
+            TextRenderer.DrawText(g, TickLabel(t, rulerStep), Font, new Point(Math.Clamp(x - 25, 0, Math.Max(0, Width - 65)), 0), StudioTheme.Muted);
         }
         g.FillRectangle(baseBrush, PaddingX, Center - 4, TrackWidth, 8);
         var left = Math.Clamp(X(start), PaddingX, Width - PaddingX);
         var right = Math.Clamp(X(end), PaddingX, Width - PaddingX);
+        g.FillRectangle(wash, left, Center - 20, Math.Max(0, right - left), 45);
         g.FillRectangle(selectedBrush, left, Center - 4, Math.Max(0, right - left), 8);
         DrawBoundary(start, StartGrip, startBrush, "[");
         DrawBoundary(end, EndGrip, endBrush, "]");
@@ -130,9 +134,11 @@ internal sealed class RangeBar : Control
         }
         g.FillRectangle(baseBrush, PaddingX, OverviewY, TrackWidth, 8);
         g.FillRectangle(selectedBrush, OverviewX(start), OverviewY, Math.Max(1, OverviewX(end) - OverviewX(start)), 8);
-        g.DrawRectangle(Pens.White, OverviewX(viewStart), OverviewY - 2,
+        g.DrawRectangle(overviewPen, OverviewX(viewStart), OverviewY - 2,
             Math.Max(3, OverviewX(viewStart + viewLength) - OverviewX(viewStart)), 12);
         g.DrawLine(Pens.White, OverviewX(position), OverviewY - 3, OverviewX(position), OverviewY + 11);
+
+        if (Focused) ControlPaint.DrawFocusRectangle(g, new Rectangle(1, 1, Width - 3, Height - 3), StudioTheme.Accent, BackColor);
 
         void DrawBoundary(double time, Rectangle grip, Brush brush, string label)
         {

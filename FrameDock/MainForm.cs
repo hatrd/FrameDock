@@ -86,9 +86,10 @@ internal sealed class MainForm : Form
         this.settingsPath = settingsPath ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "FrameDock", "settings.json");
         Text = "FrameDock";
-        MinimumSize = new Size(860, 680);
-        Size = new Size(1040, 800);
-        BackColor = Color.FromArgb(24, 27, 32);
+        MinimumSize = new Size(960, 800);
+        Size = new Size(1220, 860);
+        BackColor = StudioTheme.Canvas;
+        Font = StudioTheme.BodyFont;
         ForeColor = Color.White;
         KeyPreview = true;
         AllowDrop = true;
@@ -111,91 +112,206 @@ internal sealed class MainForm : Form
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         };
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 9, Padding = new Padding(12) };
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 90));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 148));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4 };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         Controls.Add(root);
-        root.Controls.Add(video, 0, 0);
-        root.Controls.Add(range, 0, 1);
 
         var readout = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
-        readout.Controls.Add(positionLabel);
-        readout.Controls.Add(new Label { Width = 22 });
-        readout.Controls.Add(rangeLabel);
-        root.Controls.Add(readout, 0, 2);
 
         var trimControls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
-        var setStart = Button("[ 设为起点", async () => await SetBoundaryAsync(true));
-        var setEnd = Button("] 设为终点", async () => await SetBoundaryAsync(false));
-        var preview = Button("R 试听片段", PreviewRangeAsync);
-        var fit = Button("F 放大选段", () => { range.FitSelection(); return Task.CompletedTask; });
-        var overview = Button("0 全片视图", () => { range.ResetView(); return Task.CompletedTask; });
+        var setStart = Button("[ 起点", async () => await SetBoundaryAsync(true));
+        var setEnd = Button("] 终点", async () => await SetBoundaryAsync(false));
+        var preview = Button("试听  R", PreviewRangeAsync);
+        var fit = Button("放大选段  F", () => { range.FitSelection(); return Task.CompletedTask; });
+        var overview = Button("全片  0", () => { range.ResetView(); return Task.CompletedTask; });
         var reset = Button("重置范围", () => { range.ResetRange(); return Task.CompletedTask; });
         trimControls.Controls.AddRange([setStart, setEnd, preview, loopRange, fit, overview, reset]);
-        root.Controls.Add(trimControls, 0, 3);
         tips.SetToolTip(setStart, "暂停在当前画面，把左边界设到播放指针（[）。Home 或 Shift+[ 跳到当前起点。");
         tips.SetToolTip(setEnd, "暂停在当前画面，把右边界设到播放指针（]）。End 或 Shift+] 跳到当前终点。");
         tips.SetToolTip(loopRange, "开启后从选区起点循环播放；修改选区会更新循环范围。空格可暂停，再次点击关闭循环。");
         tips.SetToolTip(range, "上方绿/橙手柄拖边界，下方白色指针拖播放位置。滚轮缩放；Shift+滚轮或右键拖动平移；底部总览定位视角。");
 
-        var controls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
         var open = Button("打开视频", async () => await PickVideoAsync());
-        var play = Button("播放/暂停", async () => await TogglePauseAsync());
-        var export = Button("D 导出片段", async () => await SubmitExportAsync());
+        var play = Button("播放 / 暂停", async () => await TogglePauseAsync());
+        var export = Button("导出片段  D", async () => await SubmitExportAsync());
         var outputFolder = Button("打开输出目录", () => {
             if (media is not null) Process.Start(new ProcessStartInfo(Path.GetDirectoryName(media.Path)!) { UseShellExecute = true });
             return Task.CompletedTask;
         });
-        controls.Controls.AddRange([open, play, export, copy, normalizeAudio, outputFolder]);
-        root.Controls.Add(controls, 0, 4);
         tips.SetToolTip(normalizeAudio, "导出到 −14 LUFS，真峰值上限 −1 dBTP；适合偏小的网络视频录音。开启后使用精确模式，音频编码为 AAC。自动记住上次设置，预览保持原音。");
         tips.SetToolTip(copy, "纯复制会从所选起点之前的关键帧开始，可能多留一小段头部。需要准确去头时取消勾选。");
 
-        var coverControls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
-        var chooseCover = Button("C 选封面", SelectCoverAsync);
-        var shot = Button("S 导出封面", async () => await ScreenshotAsync());
-        var bundle = Button("Shift+D 片段 + 封面", async () => await SubmitExportAsync(true));
-        var clearCover = Button("清除封面", () => { ClearCover(); return Task.CompletedTask; });
-        coverControls.Controls.AddRange([coverPreview, coverLabel, chooseCover, shot, bundle, clearCover]);
-        root.Controls.Add(coverControls, 0, 5);
+        var chooseCover = Button("选封面  C", SelectCoverAsync);
+        var shot = Button("导出封面  S", async () => await ScreenshotAsync());
+        var bundle = Button("片段 + 封面  Shift+D", async () => await SubmitExportAsync(true));
+        var clearCover = Button("清除", () => { ClearCover(); return Task.CompletedTask; });
         tips.SetToolTip(chooseCover, "锁定当前画面和字幕为封面。之后移动播放指针不会改变它。");
         tips.SetToolTip(shot, "导出已选封面；尚未选封面时导出当前画面。Shift+S 始终截取当前画面。");
         tips.SetToolTip(bundle, "将片段加入后台队列，并保存同名 PNG 封面。尚未选封面时使用当前画面。");
 
-        var lower = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
-        lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        lower.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        lower.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        lower.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.Controls.Add(lower, 0, 6);
-        var selectors = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
-        selectors.Controls.AddRange([TinyLabel("音轨"), audio, TinyLabel("字幕"), subtitle,
-            TinyLabel("预览"), previewScale]);
-        lower.Controls.Add(selectors, 0, 0);
-        var settings = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
-        var shortcutHelp = Button("F1 快捷键总览", () => { ShowShortcutHelp(); return Task.CompletedTask; });
-        settings.Controls.AddRange([TinyLabel("并发"), parallel, startup, shortcutHelp]);
+        var shortcutHelp = Button("快捷键  F1", () => { ShowShortcutHelp(); return Task.CompletedTask; });
         var clockwise = Button("顺时针 90°", () => RotateAsync(90));
         var counterclockwise = Button("逆时针 90°", () => RotateAsync(-90));
-        settings.Controls.AddRange([counterclockwise, clockwise, rotationLabel]);
         tips.SetToolTip(clockwise, "旋转预览和新截图；导出旋转视频时自动使用精确模式。已锁定封面保持原样。");
-        lower.Controls.Add(settings, 0, 1);
-        lower.Controls.Add(jobs, 0, 2);
-        root.Controls.Add(new Label { Dock = DockStyle.Fill, ForeColor = Color.Silver,
-            Text = "H/L 或 ←/→ 逐帧 · J/K 或 ↓/↑ 跳秒 · [ / ] 设头尾 · Home/End 或 Shift+[ / ] 跳头尾\n" +
-                "滚轮缩放 · Shift+滚轮平移 · 空格 播放/暂停 · C 选封面 · Shift+D 一起导出 · F1 快捷键总览",
-            TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true }, 0, 7);
-        root.Controls.Add(status, 0, 8);
+        // Keep playback and trimming together; export configuration has its own quiet rail.
+        root.SuspendLayout();
+        root.Padding = new Padding(18, 10, 18, 12);
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = Padding.Empty };
+        header.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 156));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 234));
+        header.Controls.Add(new Label { Text = "FrameDock", Font = StudioTheme.TitleFont, Dock = DockStyle.Fill,
+            ForeColor = StudioTheme.Text, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        var sourceName = new Label { Text = "视频片段与封面", ForeColor = StudioTheme.Muted,
+            Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+        header.Controls.Add(sourceName, 1, 0);
+        var headerActions = StudioFlow();
+        headerActions.Controls.AddRange([open, shortcutHelp]);
+        header.Controls.Add(headerActions, 2, 0);
+        root.Controls.Add(header, 0, 0);
+        var workspace = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+        workspace.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        workspace.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 292));
+        root.Controls.Add(workspace, 0, 1);
+        var editor = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0, 0, 18, 0) };
+        editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        editor.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
+        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+        workspace.Controls.Add(editor, 0, 0);
+        video.Margin = Padding.Empty;
+        editor.Controls.Add(video, 0, 0);
+        range.Margin = new Padding(0, 8, 0, 0);
+        editor.Controls.Add(range, 0, 1);
+        readout.WrapContents = true;
+        readout.Margin = Padding.Empty;
+        positionLabel.Font = StudioTheme.TimeFont;
+        positionLabel.ForeColor = StudioTheme.Text;
+        positionLabel.Margin = new Padding(0, 0, 0, 4);
+        rangeLabel.ForeColor = StudioTheme.Muted;
+        rangeLabel.Margin = Padding.Empty;
+        readout.Controls.AddRange([TinyLabel("画面"), positionLabel, rangeLabel]);
+        readout.SetFlowBreak(positionLabel, true);
+        readout.SizeChanged += (_, _) => rangeLabel.MaximumSize = new Size(Math.Max(1, readout.ClientSize.Width), 0);
+        editor.Controls.Add(readout, 0, 2);
+        trimControls.WrapContents = true;
+        trimControls.Margin = Padding.Empty;
+        trimControls.Controls.Add(play);
+        trimControls.Controls.SetChildIndex(play, 0);
+        StudioTheme.StyleButton(setStart, StudioTheme.Start);
+        StudioTheme.StyleButton(setEnd, StudioTheme.End);
+        StudioTheme.StyleToggle(loopRange);
+        editor.Controls.Add(trimControls, 0, 3);
+        var sidebar = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5,
+            BackColor = StudioTheme.Surface, Padding = new Padding(14), Margin = Padding.Empty };
+        sidebar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 172));
+        sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 144));
+        sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 170));
+        sidebar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        workspace.Controls.Add(sidebar, 1, 0);
+        var tracks = StudioSection("预览设置");
+        audio.Width = subtitle.Width = 202;
+        previewScale.Width = 78;
+        foreach (var input in new Control[] { audio, subtitle, previewScale, parallel }) StudioTheme.StyleInput(input);
+        tracks.Controls.AddRange([TinyLabel("音轨"), audio, TinyLabel("字幕"), subtitle, TinyLabel("缩放"), previewScale]);
+        tracks.SetFlowBreak(previewScale, true);
+        rotationLabel.ForeColor = StudioTheme.Muted;
+        tips.SetToolTip(counterclockwise, tips.GetToolTip(clockwise));
+        tracks.Controls.AddRange([counterclockwise, clockwise, rotationLabel]);
+        sidebar.Controls.Add(tracks, 0, 0);
+        var covers = StudioSection("封面");
+        coverPreview.Size = new Size(86, 50);
+        coverPreview.Margin = new Padding(0, 2, 8, 10);
+        coverLabel.Width = 145;
+        coverLabel.Height = 54;
+        coverLabel.ForeColor = StudioTheme.Muted;
+        coverLabel.Margin = new Padding(0, 2, 0, 10);
+        covers.Controls.AddRange([coverPreview, coverLabel, chooseCover, shot, clearCover]);
+        covers.SetFlowBreak(coverLabel, true);
+        sidebar.Controls.Add(covers, 0, 1);
+        var exports = StudioSection("导出");
+        copy.ForeColor = normalizeAudio.ForeColor = StudioTheme.Text;
+        copy.Margin = normalizeAudio.Margin = new Padding(0, 0, 0, 6);
+        exports.Controls.AddRange([copy, normalizeAudio]);
+        exports.SetFlowBreak(copy, true);
+        exports.SetFlowBreak(normalizeAudio, true);
+        bundle.AutoSize = false;
+        bundle.Size = new Size(246, 34);
+        StudioTheme.StyleButton(bundle, StudioTheme.Accent, primary: true);
+        exports.Controls.AddRange([bundle, export, outputFolder]);
+        sidebar.Controls.Add(exports, 0, 2);
+        var queue = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = Padding.Empty };
+        queue.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        queue.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        queue.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var queueHeader = StudioFlow();
+        var queueTitle = TinyLabel("导出队列");
+        queueTitle.Width = 104;
+        queueTitle.Font = StudioTheme.SectionFont;
+        queueTitle.ForeColor = StudioTheme.Text;
+        queueHeader.Controls.AddRange([queueTitle, TinyLabel("并发"), parallel]);
+        queue.Controls.Add(queueHeader, 0, 0);
+        jobs.BackColor = StudioTheme.Canvas;
+        jobs.ForeColor = StudioTheme.Text;
+        jobs.DrawMode = DrawMode.OwnerDrawFixed;
+        jobs.ItemHeight = 34;
+        jobs.DrawItem += DrawJob;
+        jobs.MouseMove += (_, e) => {
+            var index = jobs.IndexFromPoint(e.Location);
+            var description = index < 0 ? "右键任务可定位导出文件或取消导出。" : jobs.Items[index].ToString();
+            if (tips.GetToolTip(jobs) != description) tips.SetToolTip(jobs, description);
+        };
+        tips.SetToolTip(jobs, "右键任务可定位导出文件或取消导出。");
+        queue.Controls.Add(jobs, 0, 1);
+        sidebar.Controls.Add(queue, 0, 3);
+        startup.ForeColor = StudioTheme.Muted;
+        startup.Margin = new Padding(0, 10, 0, 0);
+        sidebar.Controls.Add(startup, 0, 4);
+        root.Controls.Add(new Label { Dock = DockStyle.Fill, AutoEllipsis = true, Margin = Padding.Empty,
+            Text = "空格 播放 / 暂停    ← / → 逐帧    [ / ] 设首尾    滚轮 缩放    F1 全部快捷键",
+            ForeColor = StudioTheme.Muted, TextAlign = ContentAlignment.MiddleLeft }, 0, 2);
+        headerActions.WrapContents = false;
+        status.BackColor = StudioTheme.Surface;
+        status.ForeColor = StudioTheme.Text;
+        status.Padding = new Padding(10, 0, 10, 0);
+        status.Margin = Padding.Empty;
+        status.TextAlign = ContentAlignment.MiddleLeft;
+        root.Controls.Add(status, 0, 3);
+        video.Paint += (_, e) => {
+            sourceName.Text = media is null ? "视频片段与封面" : Path.GetFileName(media.Path);
+            if (media is not null) return;
+            TextRenderer.DrawText(e.Graphics, "把视频拖到这里", StudioTheme.EmptyStateFont,
+                new Rectangle(0, video.Height / 2 - 30, video.Width, 38), StudioTheme.Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            TextRenderer.DrawText(e.Graphics, "MKV / MP4，或点击右上角打开视频", Font,
+                new Rectangle(0, video.Height / 2 + 18, video.Width, 28), StudioTheme.Muted,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        };
+        root.ResumeLayout(true);
 
         var jobsMenu = new ContextMenuStrip();
-        jobsMenu.Items.Add("取消所选任务", null, (_, _) => CancelSelectedJob());
+        var showExport = jobsMenu.Items.Add("在资源管理器中显示", null, (_, _) => RevealSelectedJob());
+        var cancelExport = jobsMenu.Items.Add("取消所选任务", null, (_, _) => CancelSelectedJob());
+        jobs.MouseDown += (_, e) => {
+            // A right click must target the row under the pointer, not a previous selection.
+            if (e.Button == MouseButtons.Right) jobs.SelectedIndex = jobs.IndexFromPoint(e.Location);
+        };
+        jobsMenu.Opening += (_, e) => {
+            var job = jobs.SelectedItem as Job;
+            e.Cancel = job is null;
+            showExport.Enabled = job is not null && File.Exists(job.Spec.OutputPath);
+            cancelExport.Enabled = job is not null && job.State is "排队" or "运行" &&
+                !job.Cancellation.IsCancellationRequested;
+        };
         jobs.ContextMenuStrip = jobsMenu;
 
         audio.SelectedIndexChanged += async (_, _) => await SelectTrackAsync("aid", audio);
@@ -207,7 +323,7 @@ internal sealed class MainForm : Form
         range.RangeChanged += UpdateRange;
         range.RangeChanged += async () => await UpdateRangeLoopAsync();
         loopRange.CheckedChanged += async (_, _) => {
-            loopRange.BackColor = loopRange.Checked ? Color.FromArgb(42, 105, 74) : Color.FromArgb(43, 49, 59);
+            loopRange.BackColor = loopRange.Checked ? StudioTheme.Selection : StudioTheme.Raised;
             await UpdateRangeLoopAsync(startPlayback: loopRange.Checked);
         };
         normalizeAudio.CheckedChanged += (_, _) => { SaveSettings(); UpdateRange(); };
@@ -235,6 +351,12 @@ internal sealed class MainForm : Form
         ClearCover();
         UpdatePosition();
         UpdateRange();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        StudioTheme.ApplyTitleBar(this);
     }
 
     protected override void OnLoad(EventArgs e)
@@ -281,18 +403,49 @@ internal sealed class MainForm : Form
 
     private static Button Button(string text, Func<Task> action)
     {
-        var button = new Button { Text = text, AutoSize = true, Height = 30, Margin = new Padding(2),
-            FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(43, 49, 59), ForeColor = Color.White };
-        button.FlatAppearance.BorderColor = Color.FromArgb(78, 88, 104);
+        var button = new Button { Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MinimumSize = new Size(0, 32), Padding = new Padding(7, 3, 7, 3), Margin = new Padding(0, 0, 6, 6) };
+        StudioTheme.StyleButton(button);
         button.Click += async (_, _) => await action();
         return button;
     }
 
     private static Label TinyLabel(string text) => new() {
-        Text = text, AutoSize = true, ForeColor = Color.White, Margin = new Padding(7, 8, 2, 0)
+        Text = text, AutoSize = false, Width = 38, Height = 27, ForeColor = StudioTheme.Muted,
+        TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(0, 2, 5, 4)
     };
 
-    private void SetStatus(string message) => status.Text = message;
+    private static FlowLayoutPanel StudioFlow() => new() { Dock = DockStyle.Fill, WrapContents = true, Margin = Padding.Empty };
+
+    private static FlowLayoutPanel StudioSection(string title)
+    {
+        var panel = StudioFlow();
+        var heading = new Label { Text = title, Width = 246, Height = 27, Font = StudioTheme.SectionFont,
+            ForeColor = StudioTheme.Text, Margin = new Padding(0, 0, 0, 5) };
+        panel.Controls.Add(heading);
+        panel.SetFlowBreak(heading, true);
+        return panel;
+    }
+
+    private void DrawJob(object? sender, DrawItemEventArgs e)
+    {
+        if (e.Index < 0) return;
+        var job = (Job)jobs.Items[e.Index];
+        using var background = new SolidBrush((e.State & DrawItemState.Selected) != 0 ? StudioTheme.Selection : jobs.BackColor);
+        e.Graphics.FillRectangle(background, e.Bounds);
+        using var marker = new SolidBrush(job.Failure is not null ? StudioTheme.End : job.State == "完成" ? StudioTheme.Start : StudioTheme.Accent);
+        e.Graphics.FillEllipse(marker, e.Bounds.Left + 8, e.Bounds.Top + 13, 6, 6);
+        TextRenderer.DrawText(e.Graphics, job.ToString(), jobs.Font,
+            new Rectangle(e.Bounds.Left + 22, e.Bounds.Top, e.Bounds.Width - 28, e.Bounds.Height), jobs.ForeColor,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        e.DrawFocusRectangle();
+    }
+
+    private void SetStatus(string message)
+    {
+        status.Text = message;
+        tips.SetToolTip(status, message);
+    }
     private void Error(Exception error)
     {
         SetStatus(error.Message);
@@ -348,6 +501,7 @@ internal sealed class MainForm : Form
             if (player is not null) { await player.DisposeAsync(); player = null; }
             var info = await Probe.ReadAsync(path);
             media = info;
+            video.Invalidate();
             rotation = 0;
             rotationLabel.Text = "旋转 0°";
             ClearCover();
@@ -615,7 +769,7 @@ internal sealed class MainForm : Form
             (normalizeAudio.Checked ? "  · 响度 −14 LUFS（精确模式）" : rotation != 0 ? "  · 旋转导出（精确模式）" : copy.Checked ? keyframes is null ? "  · 切点分析中" : $"  · 复制起点 {Clock(actual)}" : "  · 精确截取");
     }
 
-    private void UpdatePosition() => positionLabel.Text = $"画面 {Clock(lastPosition)}";
+    private void UpdatePosition() => positionLabel.Text = Clock(lastPosition);
     private static string Clock(double time) => TimeSpan.FromSeconds(Math.Max(0, time)).ToString(
         time >= 3600 ? @"hh\:mm\:ss\.fff" : @"mm\:ss\.fff", CultureInfo.InvariantCulture);
 
@@ -922,6 +1076,21 @@ internal sealed class MainForm : Form
         job.State = state;
         var index = jobs.Items.IndexOf(job);
         if (index >= 0) jobs.Items[index] = job;
+    }
+
+    internal static ProcessStartInfo CreateExplorerSelection(string path) =>
+        new("explorer.exe", $"/select,\"{Path.GetFullPath(path)}\"") { UseShellExecute = true };
+
+    private void RevealSelectedJob()
+    {
+        if (jobs.SelectedItem is not Job job) return;
+        if (!File.Exists(job.Spec.OutputPath))
+        {
+            SetStatus("导出文件不存在，可能已移动或删除，请重新导出：" + job.Spec.OutputPath);
+            return;
+        }
+        try { Process.Start(CreateExplorerSelection(job.Spec.OutputPath)); }
+        catch (Exception error) { Error(new InvalidOperationException("无法在资源管理器中显示导出文件：" + error.Message, error)); }
     }
 
     private void CancelSelectedJob()

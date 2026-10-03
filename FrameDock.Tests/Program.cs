@@ -25,7 +25,9 @@ internal static class Program
                     await TestTrayMemoryAsync(form);
                 else
                 {
+                    TestExportQueueMenu(form);
                     await TestWindowSettingsAsync(form, settingsPath);
+                    TestVisualLayout(form);
                     if (!args.Contains("--window-layout"))
                     {
                         TestTimeline(Field<RangeBar>(form, "range"));
@@ -62,6 +64,101 @@ internal static class Program
         Console.WriteLine("PASS: " + name);
     }
     private static bool Near(double actual, double expected, double tolerance = 0.002) => Math.Abs(actual - expected) < tolerance;
+
+    private static void TestExportQueueMenu(MainForm form)
+    {
+        var scratch = Path.GetFullPath(Path.Combine(".scratch/export-menu", Guid.NewGuid().ToString("N")));
+        Directory.CreateDirectory(scratch);
+        var output = Path.Combine(scratch, "导出 文件, & 片段.mp4");
+        File.WriteAllText(output, "fixture");
+        var media = new MediaInfo(Path.Combine(scratch, "source.mp4"), 10, "h264", [], []);
+        var jobType = typeof(MainForm).GetNestedType("Job", BindingFlags.NonPublic)!;
+        object Job(string path, string state)
+        {
+            var job = Activator.CreateInstance(jobType,
+                new object?[] { new ExportSpec(media, 0, 1, null, null, false, false, path), null })!;
+            jobType.GetProperty("State")!.SetValue(job, state);
+            return job;
+        }
+        var queue = Field<ListBox>(form, "jobs");
+        var menu = queue.ContextMenuStrip!;
+        void RightClick(Point point) => typeof(Control).GetMethod("OnMouseDown", Private)!
+            .Invoke(queue, [new MouseEventArgs(MouseButtons.Right, 1, point.X, point.Y, 0)]);
+        System.ComponentModel.CancelEventArgs OpenMenu()
+        {
+            var args = new System.ComponentModel.CancelEventArgs();
+            typeof(ToolStripDropDown).GetMethod("OnOpening", Private)!.Invoke(menu, [args]);
+            return args;
+        }
+        queue.Items.Add(Job(Path.Combine(scratch, "pending.mp4"), "排队"));
+        queue.Items.Add(Job(output, "完成"));
+        try
+        {
+            queue.SelectedIndex = 0;
+            var row = queue.GetItemRectangle(1);
+            RightClick(new Point(row.Left + 4, row.Top + row.Height / 2));
+            Check(queue.SelectedIndex == 1, "right click targets the clicked export instead of the old selection");
+            Check(!OpenMenu().Cancel && menu.Items[0].Enabled && !menu.Items[1].Enabled,
+                "completed exports can be revealed and cannot be cancelled");
+            var start = MainForm.CreateExplorerSelection(output);
+            Check(start.FileName == "explorer.exe" && start.UseShellExecute &&
+                start.Arguments == $"/select,\"{output}\"",
+                "Explorer selects the output file with spaces, Unicode and commas quoted");
+            queue.SelectedIndex = 0;
+            Check(!OpenMenu().Cancel && !menu.Items[0].Enabled && menu.Items[1].Enabled,
+                "pending exports without a final file can only be cancelled");
+            queue.SelectedIndex = 1;
+            jobType.GetProperty("State")!.SetValue(queue.SelectedItem, "失败");
+            Check(!OpenMenu().Cancel && menu.Items[0].Enabled,
+                "a video remains accessible if a later cover export fails");
+            File.Delete(output);
+            Check(!OpenMenu().Cancel && !menu.Items[0].Enabled, "moved or deleted outputs cannot be revealed");
+            Call(form, "RevealSelectedJob");
+            Check(Field<Label>(form, "status").Text.Contains("请重新导出"),
+                "a file removed after opening the menu reports a recovery action");
+            RightClick(new Point(4, queue.ClientSize.Height - 1));
+            Check(queue.SelectedIndex == -1 && OpenMenu().Cancel,
+                "right clicking empty queue space does not act on a previous export");
+        }
+        finally
+        {
+            foreach (var job in queue.Items.Cast<object>())
+                ((CancellationTokenSource)jobType.GetProperty("Cancellation")!.GetValue(job)!).Dispose();
+            queue.Items.Clear();
+        }
+    }
+
+    private static void TestVisualLayout(MainForm form)
+    {
+        var scratch = Path.GetFullPath(".scratch/design-review");
+        Directory.CreateDirectory(scratch);
+        foreach (var size in new[] { form.MinimumSize, new Size(1220, 860) })
+        {
+            form.Size = size;
+            form.PerformLayout();
+            Application.DoEvents();
+            var clipped = AllControls(form)
+                .Where(control => control is Button or CheckBox or ComboBox or NumericUpDown)
+                .Where(control => !control.Parent!.ClientRectangle.Contains(control.Bounds))
+                .Select(control => $"{control.Text}: {control.Bounds} outside {control.Parent!.ClientRectangle}")
+                .ToArray();
+            Check(clipped.Length == 0, $"interactive controls fit at {size.Width}x{size.Height}: {string.Join("; ", clipped)}");
+            var queue = Field<ListBox>(form, "jobs");
+            Check(queue.ClientSize.Height >= queue.ItemHeight, "minimum queue area shows a complete task row");
+            using var bitmap = new Bitmap(form.Width, form.Height);
+            form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
+            bitmap.Save(Path.Combine(scratch, $"workspace-{size.Width}x{size.Height}.png"));
+        }
+        using var help = new ShortcutHelpForm();
+        help.Show(form);
+        help.PerformLayout();
+        using var helpBitmap = new Bitmap(help.Width, help.Height);
+        help.DrawToBitmap(helpBitmap, new Rectangle(Point.Empty, help.Size));
+        helpBitmap.Save(Path.Combine(scratch, "shortcuts.png"));
+        Check(AllControls(help).OfType<Button>().All(button => button.Parent!.ClientRectangle.Contains(button.Bounds)),
+            "shortcut help close button remains accessible");
+        help.Close();
+    }
 
     private static async Task TestWindowSettingsAsync(MainForm form, string settingsPath)
     {
@@ -338,10 +435,12 @@ internal static class Program
         Check((await player.PropertyAsync("pause")).GetBoolean() && Near((await player.PropertyAsync("time-pos")).GetDouble(), 60.4, 0.08), "R stops playback at selected end");
         form.Size = form.MinimumSize;
         form.PerformLayout();
-        Check(AllControls(form).OfType<Button>().All(button => button.Parent!.ClientRectangle.Contains(button.Bounds)), "all buttons fit at minimum window size");
+        foreach (var button in AllControls(form).OfType<Button>().Where(button => !button.Parent!.ClientRectangle.Contains(button.Bounds)))
+            Console.Error.WriteLine($"Clipped button: {button.Text}, bounds={button.Bounds}, container={button.Parent!.ClientRectangle}");
         using var screenshot = new Bitmap(form.Width, form.Height);
         form.DrawToBitmap(screenshot, new Rectangle(Point.Empty, form.Size));
         screenshot.Save(Path.Combine(scratch, "minimum-window.png"));
+        Check(AllControls(form).OfType<Button>().All(button => button.Parent!.ClientRectangle.Contains(button.Bounds)), "all buttons fit at minimum window size");
         await CallAsync(form, "OpenVideoAsync", source);
         Check(Field<object?>(form, "selectedCover") is null && Field<PictureBox>(form, "coverPreview").Image is null, "opening another video clears the selected cover");
     }

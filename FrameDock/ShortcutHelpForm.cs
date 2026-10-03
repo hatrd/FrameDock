@@ -2,6 +2,12 @@ namespace FrameDock;
 
 internal sealed class ShortcutHelpForm : Form
 {
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        StudioTheme.ApplyTitleBar(this);
+    }
+
     public ShortcutHelpForm()
     {
         Text = "FrameDock · 快捷键总览";
@@ -11,18 +17,19 @@ internal sealed class ShortcutHelpForm : Form
         ShowInTaskbar = false;
         MinimizeBox = false;
         MaximizeBox = false;
-        BackColor = Color.FromArgb(24, 27, 32);
-        ForeColor = Color.White;
+        BackColor = StudioTheme.Canvas;
+        Font = StudioTheme.BodyFont;
+        ForeColor = StudioTheme.Text;
 
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3,
-            Padding = new Padding(12) };
+            Padding = new Padding(20) };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         Controls.Add(layout);
         layout.Controls.Add(new Label { Dock = DockStyle.Fill,
             Text = "当前快捷键（只读）\n编辑快捷键仅在主窗口生效；下拉框和输入框保留自己的键盘操作。",
-            ForeColor = Color.Gainsboro }, 0, 0);
+            ForeColor = StudioTheme.Muted }, 0, 0);
 
         var list = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true,
             AllowUserToAddRows = false, AllowUserToDeleteRows = false,
@@ -30,19 +37,21 @@ internal sealed class ShortcutHelpForm : Form
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
             AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells,
             RowHeadersVisible = false, MultiSelect = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-            BackgroundColor = Color.FromArgb(31, 34, 40), BorderStyle = BorderStyle.None,
+            BackgroundColor = StudioTheme.Surface, BorderStyle = BorderStyle.None,
             CellBorderStyle = DataGridViewCellBorderStyle.None, ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None,
             EnableHeadersVisualStyles = false };
         list.DefaultCellStyle.BackColor = list.BackgroundColor;
-        list.DefaultCellStyle.ForeColor = Color.White;
-        list.DefaultCellStyle.SelectionBackColor = Color.FromArgb(55, 70, 89);
-        list.DefaultCellStyle.SelectionForeColor = Color.White;
+        list.DefaultCellStyle.ForeColor = StudioTheme.Text;
+        list.DefaultCellStyle.SelectionBackColor = StudioTheme.Selection;
+        list.DefaultCellStyle.SelectionForeColor = StudioTheme.Text;
+        list.DefaultCellStyle.Padding = new Padding(10, 7, 10, 7);
+        list.ColumnHeadersDefaultCellStyle.Padding = new Padding(10, 0, 10, 0);
         list.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
-        list.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(43, 49, 59);
-        list.ColumnHeadersDefaultCellStyle.ForeColor = Color.Gainsboro;
-        list.ColumnHeadersDefaultCellStyle.SelectionBackColor = Color.FromArgb(43, 49, 59);
+        list.ColumnHeadersDefaultCellStyle.BackColor = StudioTheme.Raised;
+        list.ColumnHeadersDefaultCellStyle.ForeColor = StudioTheme.Muted;
+        list.ColumnHeadersDefaultCellStyle.SelectionBackColor = StudioTheme.Raised;
         list.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
-        list.ColumnHeadersHeight = 28;
+        list.ColumnHeadersHeight = 36;
         list.RowTemplate.Height = 24;
         list.RowTemplate.MinimumHeight = 24;
         list.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "按键 / 操作", FillWeight = 34,
@@ -55,8 +64,8 @@ internal sealed class ShortcutHelpForm : Form
         {
             var heading = list.Rows[list.Rows.Add(title, "")];
             heading.MinimumHeight = 28;
-            heading.DefaultCellStyle.BackColor = Color.FromArgb(43, 49, 59);
-            heading.DefaultCellStyle.ForeColor = Color.FromArgb(151, 203, 255);
+            heading.DefaultCellStyle.BackColor = StudioTheme.Raised;
+            heading.DefaultCellStyle.ForeColor = StudioTheme.Accent;
             foreach (var (key, action) in entries)
                 list.Rows.Add(key, action);
         }
@@ -94,8 +103,10 @@ internal sealed class ShortcutHelpForm : Form
             ("Esc", "关闭快捷键总览"));
 
         var close = new Button { Text = "关闭 (Esc)", DialogResult = DialogResult.Cancel,
-            AutoSize = true, Anchor = AnchorStyles.Right, BackColor = Color.FromArgb(43, 49, 59),
-            ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            AutoSize = true, Anchor = AnchorStyles.Right, BackColor = StudioTheme.Raised,
+            ForeColor = StudioTheme.Text, FlatStyle = FlatStyle.Flat };
+        StudioTheme.StyleButton(close);
+        close.Padding = new Padding(12, 5, 12, 5);
         layout.Controls.Add(close, 0, 2);
         CancelButton = close;
     }
