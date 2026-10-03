@@ -6,16 +6,21 @@ internal sealed record BeatEstimate(double Bpm, double Offset, double Confidence
 internal static class AudioEditing
 {
     public const int SampleRate = 48000;
+    public const double MaxBeatAnalysisSeconds = 180;
 
     // Stream a reduced mono signal; never retain a whole decoded song in the UI.
-    public static async Task<AudioEnvelope> AnalyzeAsync(MediaInfo media, int index, CancellationToken cancellation)
+    public static async Task<AudioEnvelope> AnalyzeAsync(MediaInfo media, int index, CancellationToken cancellation,
+        double start = 0, double? end = null)
     {
+        var stop = end ?? media.Duration;
+        if (!double.IsFinite(start) || !double.IsFinite(stop) || start < 0 || stop <= start || stop > media.Duration)
+            throw new ArgumentOutOfRangeException(nameof(start), "音频分析范围必须位于媒体内。");
         const int rate = 8000;
-        var bucketSize = Math.Max(80, (int)Math.Ceiling(media.Duration * rate / 600_000));
+        var bucketSize = Math.Max(80, (int)Math.Ceiling((stop - start) * rate / 600_000));
         var peaks = new List<float>();
         var energy = new List<float>();
-        using var process = MediaProcess.Start("ffmpeg", ["-v", "error", "-nostdin", "-i", media.Path,
-            "-map", $"0:{index}", "-vn", "-sn", "-ac", "1", "-ar", rate.ToString(), "-f", "f32le", "-"]);
+        using var process = MediaProcess.Start("ffmpeg", ["-v", "error", "-nostdin", "-ss", MediaProcess.Time(start), "-i", media.Path,
+            "-t", MediaProcess.Time(stop - start), "-map", $"0:{index}", "-vn", "-sn", "-ac", "1", "-ar", rate.ToString(), "-f", "f32le", "-"]);
         using var registration = MediaProcess.CancelWith(process, cancellation);
         var errors = process.StandardError.ReadToEndAsync(cancellation);
         var buffer = new byte[32768];
@@ -42,7 +47,7 @@ internal static class AudioEditing
             }
             if (count > 0) Flush();
             await process.WaitForExitAsync(cancellation);
-            if (process.ExitCode != 0) throw new InvalidOperationException("波形分析失败：" + await errors);
+            if (process.ExitCode != 0) throw new InvalidOperationException("音频分析失败：" + await errors);
             return new AudioEnvelope(peaks.ToArray(), energy.ToArray(), bucketSize / (double)rate);
         }
         finally { MediaProcess.Kill(process); await process.WaitForExitAsync(); }
@@ -54,11 +59,25 @@ internal static class AudioEditing
         }
     }
 
-    public static BeatEstimate? Detect(AudioEnvelope envelope)
+    public static async Task<BeatEstimate?> DetectSelectionAsync(MediaInfo media, int index,
+        double start, double end, CancellationToken cancellation)
     {
+        if (!double.IsFinite(start) || !double.IsFinite(end) || start < 0 || end > media.Duration || end <= start)
+            throw new ArgumentOutOfRangeException(nameof(start), "请选择有效的媒体范围。");
+        if (end - start < 4) return null;
+        // Keep 10ms onset resolution independent of the full source duration, and bound decoding too.
+        var envelope = await AnalyzeAsync(media, index, cancellation, start,
+            Math.Min(end, start + MaxBeatAnalysisSeconds));
+        var estimate = await Task.Run(() => Detect(envelope, cancellation), cancellation);
+        return estimate is null ? null : estimate with { Offset = start + estimate.Offset };
+    }
+
+    public static BeatEstimate? Detect(AudioEnvelope envelope, CancellationToken cancellation = default)
+    {
+        cancellation.ThrowIfCancellationRequested();
         var energy = envelope.Energy;
         // Tempo from positive energy changes, with normalized autocorrelation.
-        var length = Math.Min(energy.Length, (int)(180 / envelope.Step));
+        var length = Math.Min(energy.Length, (int)(MaxBeatAnalysisSeconds / envelope.Step));
         if (length * envelope.Step < 4) return null;
         var onset = new double[length];
         for (var i = 1; i < length; i++) onset[i] = Math.Max(0, energy[i] - energy[i - 1]);
@@ -66,6 +85,7 @@ internal static class AudioEditing
         var bestLag = 0;
         for (var lag = Math.Max(1, (int)(60 / 220d / envelope.Step)); lag <= 60 / 55d / envelope.Step; lag++)
         {
+            cancellation.ThrowIfCancellationRequested();
             double sum = 0, a = 0, b = 0;
             for (var i = lag; i < length; i++)
             {

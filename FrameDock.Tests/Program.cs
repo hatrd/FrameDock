@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -21,7 +21,9 @@ internal static class Program
         form.Shown += async (_, _) => {
             try
             {
-                if (args.Contains("--audio-loops"))
+                if (args.Contains("--bpm-selection"))
+                    await TestBpmSelectionAsync(form);
+                else if (args.Contains("--audio-loops"))
                     await TestAudioLoopsAsync(form);
                 else if (args.Contains("--tray-memory"))
                     await TestTrayMemoryAsync(form);
@@ -133,13 +135,15 @@ internal static class Program
     {
         var scratch = Path.GetFullPath(".scratch/design-review");
         Directory.CreateDirectory(scratch);
+        foreach (var expanded in new[] { false, true })
         foreach (var size in new[] { form.MinimumSize, new Size(1220, 860) })
         {
             form.Size = size;
+            AllControls(form).OfType<CheckBox>().Single(control => control.Text == "节拍设置").Checked = expanded;
             form.PerformLayout();
             Application.DoEvents();
             var clipped = AllControls(form)
-                .Where(control => control is Button or CheckBox or ComboBox or NumericUpDown)
+                .Where(control => control.Visible && control is (Button or CheckBox or ComboBox or NumericUpDown))
                 .Where(control => !control.Parent!.ClientRectangle.Contains(control.Bounds))
                 .Select(control => $"{control.Text}: {control.Bounds} outside {control.Parent!.ClientRectangle}")
                 .ToArray();
@@ -148,7 +152,7 @@ internal static class Program
             Check(queue.ClientSize.Height >= queue.ItemHeight, "minimum queue area shows a complete task row");
             using var bitmap = new Bitmap(form.Width, form.Height);
             form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
-            bitmap.Save(Path.Combine(scratch, $"workspace-{size.Width}x{size.Height}.png"));
+            bitmap.Save(Path.Combine(scratch, $"workspace-{size.Width}x{size.Height}-{(expanded ? "expanded" : "compact")}.png"));
         }
         using var help = new ShortcutHelpForm();
         help.Show(form);
@@ -558,6 +562,59 @@ internal static class Program
         await CallAsync(form, "ShowFromTrayAsync");
     }
 
+    private static async Task TestBpmSelectionAsync(MainForm form)
+    {
+        var scratch = Path.GetFullPath(".scratch/bpm-selection/" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        var path = Path.Combine(scratch, "mixed-tempos.wav");
+        // The 120 BPM passage is beyond the old detector's first-180-second window.
+        await AudioEditing.RunFfmpegAsync(["-v", "error", "-y", "-f", "lavfi", "-i",
+            "aevalsrc=0.8*sin(2*PI*440*t)*lt(mod(t-0.13\\,if(lt(t\\,190)\\,0.666667\\,0.5))\\,0.03):s=8000:d=205",
+            "-c:a", "pcm_s16le", path], default);
+        await CallAsync(form, "OpenVideoAsync", path);
+        var bar = Field<RangeBar>(form, "range");
+        var bpm = Field<NumericUpDown>(form, "bpmInput");
+        var offset = Field<NumericUpDown>(form, "beatOffset");
+        bar.Start = 190.1; bar.End = 202.1;
+        Check(bar.Waveform is null, "selection BPM starts without a full-source waveform");
+        await CallAsync(form, "DetectBpmAsync");
+        Check(Near((double)bpm.Value, 120, 1), "BPM uses selected middle passage instead of outside 90 BPM intro");
+        Check(Near((double)offset.Value, 190.13, 0.03), "selection onset is restored to the absolute timeline");
+        Check(bar.Waveform is null, "BPM does not decode or populate the full-source waveform");
+        var info = Field<MediaInfo>(form, "media");
+        var envelope = await AudioEditing.AnalyzeAsync(info with { Duration = 86400 }, info.Audio[0].Index,
+            default, 190.1, 202.1);
+        Check(envelope.Energy.Length == 1200 && Near(envelope.Step, 0.01),
+            "only twelve selected seconds are decoded at 10ms resolution even for day-long source metadata");
+        bar.Start = 0; bar.End = 8;
+        await CallAsync(form, "DetectBpmAsync");
+        Check(Near((double)bpm.Value, 90, 1), "changing selection redetects the intro tempo");
+        var previous = bpm.Value;
+        bar.End = 2;
+        await CallAsync(form, "DetectBpmAsync");
+        Check(bpm.Value == previous && Field<Label>(form, "status").Text.Contains("至少"),
+            "too-short selection preserves the grid and gives a recovery instruction");
+        bar.End = 180;
+        var pending = CallAsync(form, "DetectBpmAsync");
+        bar.Start = 190.1; bar.End = 202.1;
+        await pending;
+        Check(bpm.Value == previous && Field<Label>(form, "status").Text.Contains("取消"),
+            "editing selection cancels decoding and discards stale BPM results");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        try
+        {
+            await AudioEditing.DetectSelectionAsync(info, info.Audio[0].Index, 190.1, 202.1, cancellation.Token);
+            Check(false, "cancelled BPM request must throw");
+        }
+        catch (OperationCanceledException) { Check(true, "cancelled BPM decode exits cleanly"); }
+        Check(!AllControls(form).OfType<CheckBox>().Any(control => control.Text == "循环去爆音"),
+            "seam smoothing is automatic and has no frontend switch");
+        var filter = AudioEditing.TrimFilter(1, true);
+        Check(filter.Contains("afade=t=in") && filter.Contains("afade=t=out"),
+            "automatic loop treatment fades both edges without changing duration");
+    }
+
     private static async Task TestAudioLoopsAsync(MainForm form)
     {
         var scratch = Path.GetFullPath(".scratch/audio-loops/" + Guid.NewGuid().ToString("N"));
@@ -577,6 +634,7 @@ internal static class Program
             "silence does not produce a guessed BPM");
         var bar = Field<RangeBar>(form, "range");
         Field<CheckBox>(form, "showWaveform").Checked = true;
+        await Field<Task>(form, "audioAnalysisTask");
         Check(bar.ShowWaveform && bar.Waveform is { Peaks.Length: > 100 }, "waveform is available and optional");
         Field<CheckBox>(form, "snapBeat").Checked = true;
         bar.Start = 0.22; bar.End = 2.05;

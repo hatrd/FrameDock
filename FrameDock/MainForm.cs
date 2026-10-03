@@ -75,9 +75,10 @@ internal sealed class MainForm : Form
     private CancellationTokenSource? loopBuild;
     private CancellationTokenSource? audioAnalysis;
     private Task audioAnalysisTask = Task.CompletedTask;
+    private CancellationTokenSource? beatAnalysis;
+    private Task beatAnalysisTask = Task.CompletedTask;
     private readonly CheckBox showWaveform = new() { Text = "显示波形", AutoSize = true };
     private readonly CheckBox snapBeat = new() { Text = "节拍吸附", AutoSize = true };
-    private readonly CheckBox smoothLoop = new() { Text = "循环去爆音", AutoSize = true, Checked = true };
     private readonly NumericUpDown bpmInput = new() { Minimum = 0, Maximum = 400, DecimalPlaces = 2, Increment = 0.1m, Width = 78 };
     private readonly NumericUpDown beatOffset = new() { Minimum = 0, Maximum = 86400, DecimalPlaces = 3, Increment = 0.001m, Width = 86 };
     private readonly Label beatStatus = new() { AutoSize = true, ForeColor = StudioTheme.Muted, Text = "可手动输入 BPM；0 关闭节拍网格" };
@@ -170,23 +171,21 @@ internal sealed class MainForm : Form
         // Keep playback and trimming together; export configuration has its own quiet rail.
         root.SuspendLayout();
         root.Padding = new Padding(18, 10, 18, 12);
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = Padding.Empty };
         header.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 156));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 234));
-        header.Controls.Add(new Label { Text = "FrameDock", Font = StudioTheme.TitleFont, Dock = DockStyle.Fill,
-            ForeColor = StudioTheme.Text, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
-        var sourceName = new Label { Text = "音视频片段编辑", ForeColor = StudioTheme.Muted,
-            Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
+        header.Controls.Add(open, 0, 0);
+        var sourceName = new Label { ForeColor = StudioTheme.Muted,
+            Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(8, 0, 12, 0) };
         header.Controls.Add(sourceName, 1, 0);
-        var headerActions = StudioFlow();
-        headerActions.Controls.AddRange([open, shortcutHelp]);
-        header.Controls.Add(headerActions, 2, 0);
+        header.Controls.Add(shortcutHelp, 2, 0);
         root.Controls.Add(header, 0, 0);
         var workspace = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
         workspace.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -197,9 +196,9 @@ internal sealed class MainForm : Form
         editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         editor.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
-        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 102));
-        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
+        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
         editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+        editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         workspace.Controls.Add(editor, 0, 0);
         video.Margin = Padding.Empty;
         editor.Controls.Add(video, 0, 0);
@@ -216,32 +215,51 @@ internal sealed class MainForm : Form
         readout.SetFlowBreak(positionLabel, true);
         readout.SizeChanged += (_, _) => rangeLabel.MaximumSize = new Size(Math.Max(1, readout.ClientSize.Width), 0);
         var beatControls = StudioFlow();
-        foreach (var toggle in new[] { showWaveform, snapBeat, smoothLoop }) toggle.ForeColor = StudioTheme.Text;
+        foreach (var toggle in new[] { showWaveform, snapBeat }) toggle.ForeColor = StudioTheme.Text;
         StudioTheme.StyleInput(bpmInput); StudioTheme.StyleInput(beatOffset);
-        var detectBpm = Button("侦测 BPM", DetectBpmAsync);
+        var detectBpm = Button("检测选区", DetectBpmAsync);
+        tips.SetToolTip(detectBpm, "只检测当前选区的所选音轨；至少 4 秒，超过 180 秒时只分析选区前 180 秒。无需开启全片波形。");
         var halfBpm = Button("÷2", () => { bpmInput.Value /= 2; return Task.CompletedTask; });
         var doubleBpm = Button("×2", () => { bpmInput.Value = Math.Min(bpmInput.Maximum, bpmInput.Value * 2); return Task.CompletedTask; });
         var alignBeat = Button("此处为节拍", () => { beatOffset.Value = Math.Clamp((decimal)lastPosition, 0, beatOffset.Maximum); return Task.CompletedTask; });
-        beatControls.Controls.AddRange([showWaveform, snapBeat, smoothLoop, detectBpm, TinyLabel("BPM"), bpmInput,
+        var beatSettings = new CheckBox { Text = "节拍设置", AutoSize = true, ForeColor = StudioTheme.Muted,
+            Margin = new Padding(12, 3, 0, 0) };
+        var audioTools = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = Padding.Empty };
+        audioTools.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        audioTools.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        audioTools.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var audioToggles = StudioFlow();
+        audioToggles.Controls.AddRange([showWaveform, snapBeat, beatSettings]);
+        audioTools.Controls.Add(audioToggles, 0, 0);
+        beatControls.Controls.AddRange([detectBpm, TinyLabel("BPM"), bpmInput,
             halfBpm, doubleBpm, TinyLabel("偏移 s"), beatOffset, alignBeat, beatStatus]);
-        beatControls.SetFlowBreak(detectBpm, true);
+
         beatControls.SetFlowBreak(alignBeat, true);
-        editor.Controls.Add(beatControls, 0, 2);
-        tips.SetToolTip(smoothLoop, "选段首尾各做 2ms 淡化，避免波形跳变爆音，保持选段时长。音频 WAV 导出使用相同处理；关闭可试听原始接缝。");
+        audioTools.Controls.Add(beatControls, 0, 1);
+        beatControls.Visible = false;
+        // Advanced rhythm controls should not take preview space during ordinary trimming.
+        beatSettings.CheckedChanged += (_, _) => {
+            editor.SuspendLayout();
+            beatControls.Visible = beatSettings.Checked;
+            editor.RowStyles[4].Height = beatSettings.Checked ? 120 : 34;
+            editor.ResumeLayout(true);
+        };
+        editor.Controls.Add(audioTools, 0, 4);
         tips.SetToolTip(snapBeat, "拖动边界、播放指针及 [ / ] 按节拍吸附。侦测为估计值，可手动修改 BPM、÷2 / ×2 和节拍偏移。");
-        editor.Controls.Add(readout, 0, 3);
+        editor.Controls.Add(readout, 0, 2);
         trimControls.WrapContents = true;
+        trimControls.SetFlowBreak(loopRange, true);
         trimControls.Margin = Padding.Empty;
         trimControls.Controls.Add(play);
         trimControls.Controls.SetChildIndex(play, 0);
         StudioTheme.StyleButton(setStart, StudioTheme.Start);
         StudioTheme.StyleButton(setEnd, StudioTheme.End);
         StudioTheme.StyleToggle(loopRange);
-        editor.Controls.Add(trimControls, 0, 4);
+        editor.Controls.Add(trimControls, 0, 3);
         var sidebar = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5,
             BackColor = StudioTheme.Surface, Padding = new Padding(14), Margin = Padding.Empty };
         sidebar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 172));
+        sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 184));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 144));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 170));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -308,7 +326,6 @@ internal sealed class MainForm : Form
         root.Controls.Add(new Label { Dock = DockStyle.Fill, AutoEllipsis = true, Margin = Padding.Empty,
             Text = "空格 播放 / 暂停    ← / → 逐帧    [ / ] 设首尾    滚轮 缩放    F1 全部快捷键",
             ForeColor = StudioTheme.Muted, TextAlign = ContentAlignment.MiddleLeft }, 0, 2);
-        headerActions.WrapContents = false;
         status.BackColor = StudioTheme.Surface;
         status.ForeColor = StudioTheme.Text;
         status.Padding = new Padding(10, 0, 10, 0);
@@ -316,12 +333,12 @@ internal sealed class MainForm : Form
         status.TextAlign = ContentAlignment.MiddleLeft;
         root.Controls.Add(status, 0, 3);
         video.Paint += (_, e) => {
-            sourceName.Text = media is null ? "音视频片段编辑" : Path.GetFileName(media.Path);
+            sourceName.Text = media is null ? "" : Path.GetFileName(media.Path);
             if (media?.HasVideo == true) return;
             TextRenderer.DrawText(e.Graphics, media is null ? "把视频或音频拖到这里" : "音频编辑 · 开启波形，按节拍选段", StudioTheme.EmptyStateFont,
                 new Rectangle(0, video.Height / 2 - 30, video.Width, 38), StudioTheme.Text,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-            TextRenderer.DrawText(e.Graphics, "MKV / MP4 / WAV / MP3 / FLAC，或点击右上角打开媒体", Font,
+            TextRenderer.DrawText(e.Graphics, "MKV / MP4 / WAV / MP3 / FLAC，或点击左上角打开媒体", Font,
                 new Rectangle(0, video.Height / 2 + 18, video.Width, 28), StudioTheme.Muted,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         };
@@ -350,6 +367,7 @@ internal sealed class MainForm : Form
         previewScale.SelectedIndexChanged += async (_, _) => await SetPreviewScaleAsync();
         range.SeekRequested += async time => await SeekAsync(time);
         range.RangeChanged += UpdateRange;
+        range.RangeChanged += () => beatAnalysis?.Cancel();
         range.RangeChanged += async () => await UpdateRangeLoopAsync();
         loopRange.CheckedChanged += async (_, _) => {
             loopRange.BackColor = loopRange.Checked ? StudioTheme.Selection : StudioTheme.Raised;
@@ -363,7 +381,6 @@ internal sealed class MainForm : Form
         snapBeat.CheckedChanged += (_, _) => { range.SnapToBeat = snapBeat.Checked; range.Invalidate(); };
         bpmInput.ValueChanged += (_, _) => { range.Bpm = (double)bpmInput.Value; range.Invalidate(); UpdateRange(); };
         beatOffset.ValueChanged += (_, _) => { range.BeatOffset = (double)beatOffset.Value; range.Invalidate(); };
-        smoothLoop.CheckedChanged += async (_, _) => { SaveSettings(); await UpdateRangeLoopAsync(); };
         copy.CheckedChanged += (_, _) => UpdateRange();
         parallel.ValueChanged += (_, _) => { SaveSettings(); PumpQueue(); };
         startup.CheckedChanged += (_, _) => UpdateStartup();
@@ -384,7 +401,7 @@ internal sealed class MainForm : Form
             if (this.initialPath is not null) await OpenVideoAsync(this.initialPath);
         };
         LoadSettings();
-        SetStatus("把 MKV 或 MP4 拖进窗口。");
+        SetStatus("打开媒体或拖入视频、音频开始编辑。");
         ClearCover();
         UpdatePosition();
         UpdateRange();
@@ -529,7 +546,7 @@ internal sealed class MainForm : Form
             return;
         }
         loading = true;
-        loopBuild?.Cancel(); audioAnalysis?.Cancel();
+        loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
         await seekPump;
         await previewLifecycle.WaitAsync();
         try
@@ -540,10 +557,11 @@ internal sealed class MainForm : Form
             await keyframeScanTask;
             if (player is not null) { await player.DisposeAsync(); player = null; }
             bufferedLoop?.Dispose(); bufferedLoop = null;
-            await audioAnalysisTask;
+            await audioAnalysisTask; await beatAnalysisTask;
             var info = await Probe.ReadAsync(path);
             media = info;
             range.Waveform = null;
+            beatOffset.Maximum = Math.Max(86400, (decimal)info.Duration);
             bpmInput.Value = beatOffset.Value = 0;
             beatStatus.Text = "可手动输入 BPM；0 关闭节拍网格";
             copy.Enabled = subtitle.Enabled = info.HasVideo;
@@ -672,7 +690,7 @@ internal sealed class MainForm : Form
             finally { previewLifecycle.Release(); }
             if (property == "aid")
             {
-                audioAnalysis?.Cancel(); await audioAnalysisTask;
+                audioAnalysis?.Cancel(); beatAnalysis?.Cancel(); await audioAnalysisTask; await beatAnalysisTask;
                 range.Waveform = null; range.Invalidate();
                 bpmInput.Value = beatOffset.Value = 0;
                 beatStatus.Text = "音轨已切换，可重新侦测 BPM";
@@ -823,7 +841,7 @@ internal sealed class MainForm : Form
             SetStatus("正在缓冲无缝循环选段…");
             prepared = await LoopPreview.CreateAsync(source, range.Start, range.End,
                 (audio.SelectedItem as TrackOption)?.Index, (subtitle.SelectedItem as TrackOption)?.Index,
-                rotation, smoothLoop.Checked, build.Token);
+                rotation, true, build.Token);
             build.Token.ThrowIfCancellationRequested();
             bufferedLoop = prepared; prepared = null;
             await target.PauseAsync(true);
@@ -897,17 +915,43 @@ internal sealed class MainForm : Form
 
     private async Task DetectBpmAsync()
     {
-        SetStatus("正在分析节拍…");
-        await AnalyzeAudioAsync();
-        var envelope = range.Waveform;
-        if (envelope is null) { SetStatus("请选择音轨后侦测 BPM。"); return; }
-        var estimate = await Task.Run(() => AudioEditing.Detect(envelope));
-        if (range.Waveform != envelope) return;
-        if (estimate is null) { beatStatus.Text = "未找到稳定节拍，请手动输入 BPM"; SetStatus(beatStatus.Text); return; }
-        bpmInput.Value = (decimal)Math.Round(estimate.Bpm, 2);
-        beatOffset.Value = (decimal)Math.Round(estimate.Offset, 3);
-        beatStatus.Text = $"估计 {estimate.Bpm:F2} BPM · 可信度 {estimate.Confidence:P0} · 可手动校正";
-        SetStatus(beatStatus.Text);
+        if (media is null || loading || !Visible || audio.SelectedItem is not TrackOption { Index: int index })
+        { SetStatus("请选择音轨后检测选区 BPM。"); return; }
+        var source = media;
+        var start = range.Start;
+        var end = range.End;
+        beatAnalysis?.Cancel();
+        await beatAnalysisTask;
+        if (media != source || range.Start != start || range.End != end ||
+            (audio.SelectedItem as TrackOption)?.Index != index || loading || !Visible) return;
+        if (end - start < 4)
+        { SetStatus("选区至少需要 4 秒才能检测 BPM，请扩大选区。"); return; }
+        using var cancellation = new CancellationTokenSource();
+        beatAnalysis = cancellation;
+        SetStatus(end - start > AudioEditing.MaxBeatAnalysisSeconds
+            ? "正在检测选区前 180 秒的 BPM…" : "正在检测选区 BPM…");
+        beatAnalysisTask = AnalyzeSelection();
+        await beatAnalysisTask;
+        if (beatAnalysis == cancellation) beatAnalysis = null;
+
+        async Task AnalyzeSelection()
+        {
+            try
+            {
+                var estimate = await AudioEditing.DetectSelectionAsync(source, index, start, end, cancellation.Token);
+                if (cancellation.IsCancellationRequested || media != source || range.Start != start || range.End != end ||
+                    (audio.SelectedItem as TrackOption)?.Index != index) return;
+                if (estimate is null)
+                { beatStatus.Text = "选区未找到稳定节拍，请调整选区或手动输入 BPM"; SetStatus(beatStatus.Text); return; }
+                bpmInput.Value = (decimal)Math.Round(estimate.Bpm, 2);
+                beatOffset.Value = Math.Clamp((decimal)Math.Round(estimate.Offset, 3), beatOffset.Minimum, beatOffset.Maximum);
+                beatStatus.Text = $"选区估计 {estimate.Bpm:F2} BPM · 可信度 {estimate.Confidence:P0} · 可手动校正";
+                SetStatus(beatStatus.Text);
+            }
+            catch (OperationCanceledException)
+            { if (media == source && Visible && !loading) SetStatus("选区或音轨已变化，检测已取消；请重新检测。"); }
+            catch (Exception error) { if (!cancellation.IsCancellationRequested) Error(error); }
+        }
     }
 
     private double ActualStart()
@@ -1169,7 +1213,8 @@ internal sealed class MainForm : Form
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (proceed != DialogResult.Yes) return;
             }
-            var smooth = !media.HasVideo && smoothLoop.Checked;
+            // Audio loops always share the same short edge fades in preview and export.
+            var smooth = !media.HasVideo;
             var output = OutputNames.Clip(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, extension, rotation, normalize, smooth);
             var copyKeyframe = doCopy ? keyframes?.FindLast(frame => frame.Position <= start + 0.0005) : null;
             var spec = new ExportSpec(media, start, range.End, audioTrack, burn ? sub : null, doCopy, burn, output,
@@ -1339,7 +1384,7 @@ internal sealed class MainForm : Form
     private async Task HideToTrayAsync()
     {
         Hide();
-        loopBuild?.Cancel(); audioAnalysis?.Cancel();
+        loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
         previewingRange = false;
         keyframeScan?.Cancel();
         var release = releasingPlayer ??= ReleasePreviewAsync();
@@ -1359,9 +1404,9 @@ internal sealed class MainForm : Form
         try
         {
             keyframeScan?.Cancel();
-            audioAnalysis?.Cancel();
+            audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
             await keyframeScanTask;
-            await audioAnalysisTask;
+            await audioAnalysisTask; await beatAnalysisTask;
             await seekPump;
             if (player is not null)
             {
@@ -1379,7 +1424,7 @@ internal sealed class MainForm : Form
     {
         if (runningJobs.Count + waiting.Count == 0)
         {
-            loopBuild?.Cancel(); audioAnalysis?.Cancel();
+            loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
             await ReleasePreviewAsync();
             ExitNow(); return;
         }
@@ -1411,7 +1456,7 @@ internal sealed class MainForm : Form
         SaveWindowSettings();
         exiting = true;
         keyframeScan?.Cancel();
-        loopBuild?.Cancel(); audioAnalysis?.Cancel();
+        loopBuild?.Cancel(); audioAnalysis?.Cancel(); beatAnalysis?.Cancel();
         tray.Visible = false;
         tray.Dispose();
         _ = ReleasePreviewAsync();
@@ -1429,8 +1474,6 @@ internal sealed class MainForm : Form
                     normalizeAudio.Checked = normalized.GetBoolean();
                 if (document.RootElement.TryGetProperty("showWaveform", out var wave) && wave.ValueKind is JsonValueKind.True or JsonValueKind.False)
                     showWaveform.Checked = wave.GetBoolean();
-                if (document.RootElement.TryGetProperty("smoothLoop", out var smooth) && smooth.ValueKind is JsonValueKind.True or JsonValueKind.False)
-                    smoothLoop.Checked = smooth.GetBoolean();
                 if (document.RootElement.TryGetProperty("maxParallel", out var value))
                     parallel.Value = Math.Clamp(value.GetInt32(), 1, 4);
                 if (document.RootElement.TryGetProperty("window", out var window) && window.ValueKind == JsonValueKind.Object &&
@@ -1459,7 +1502,7 @@ internal sealed class MainForm : Form
                 ? new { x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height, maximized = windowMaximized }
                 : null;
             File.WriteAllText(settingsPath, JsonSerializer.Serialize(new { maxParallel = (int)parallel.Value, normalizeAudio = normalizeAudio.Checked,
-                showWaveform = showWaveform.Checked, smoothLoop = smoothLoop.Checked, window }));
+                showWaveform = showWaveform.Checked, window }));
         }
         catch (Exception error) { SetStatus("保存设置失败：" + error.Message); }
     }
