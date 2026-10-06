@@ -177,8 +177,8 @@ if (args.Contains("--loudness"))
             throw new Exception($"Transients were reshaped: gain={gain}, residual={residual / (energy * gain * gain)}.");
         if (normalized.Max(x => Math.Abs(x)) > Math.Pow(10, Loudness.ProcessingPeak / 20) + 0.001)
             throw new Exception("Normalized transient exceeds processing peak ceiling.");
-        var output = await Exporter.RunAsync(spec, default);
-        using var measurement = MediaProcess.Start("ffmpeg", ["-hide_banner", "-nostdin", "-i", output.Path,
+        await Exporter.RunAsync(spec, default);
+        using var measurement = MediaProcess.Start("ffmpeg", ["-hide_banner", "-nostdin", "-i", spec.OutputPath,
             "-vn", "-af", Loudness.Target + ":print_format=json", "-f", "null", "-"]);
         var stderr = measurement.StandardError.ReadToEndAsync();
         var stdout = measurement.StandardOutput.ReadToEndAsync();
