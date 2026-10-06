@@ -114,6 +114,64 @@ await Case("coarse time base precise frame boundary", async () => {
 });
 if (args.Contains("--loudness"))
 {
+    await Case("peak-limited normalization preserves the waveform", async () => {
+        var transient = Path.Combine(run, "transient.mkv");
+        // A quiet tone with one loud transient cannot reach -14 LUFS without compression.
+        await Ffmpeg("-i", fixture, "-f", "lavfi", "-i",
+            "aevalsrc='0.01*sin(2*PI*440*t)+if(between(t,2,2.01),0.7*sin(2*PI*880*t),0)':s=48000:d=5",
+            "-t", "5", "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "pcm_f32le", transient);
+        var media = await Probe.ReadAsync(transient);
+        var spec = new ExportSpec(media, 0.217, 4.4, media.Audio[0].Index, null, false, false,
+            Path.Combine(run, "normalized-transient.mkv"), NormalizeAudio: true);
+        var filter = await Loudness.MeasureAsync(spec, default);
+        var originalPcm = Path.Combine(run, "transient-original.f32");
+        var normalizedPcm = Path.Combine(run, "transient-normalized.f32");
+        async Task<float[]> Samples(string path, string processing)
+        {
+            await Ffmpeg("-ss", MediaProcess.Time(spec.Start), "-i", transient, "-map", "0:a:0",
+                "-af", $"atrim=duration={MediaProcess.Time(spec.End - spec.Start)},{processing}",
+                "-f", "f32le", path);
+            return System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(await File.ReadAllBytesAsync(path)).ToArray();
+        }
+        var original = await Samples(originalPcm, "anull");
+        var normalized = await Samples(normalizedPcm, filter);
+        if (original.Length != normalized.Length) throw new Exception("Normalization changed sample count.");
+        double energy = 0, product = 0;
+        for (var i = 0; i < original.Length; i++)
+        {
+            energy += (double)original[i] * original[i];
+            product += (double)original[i] * normalized[i];
+        }
+        var gain = product / energy;
+        double residual = 0;
+        for (var i = 0; i < original.Length; i++) residual += Math.Pow(normalized[i] - gain * original[i], 2);
+        if (gain <= 1 || residual / (energy * gain * gain) > 1e-12)
+            throw new Exception($"Transients were reshaped: gain={gain}, residual={residual / (energy * gain * gain)}.");
+        if (normalized.Max(x => Math.Abs(x)) > Math.Pow(10, Loudness.ProcessingPeak / 20) + 0.001)
+            throw new Exception("Normalized transient exceeds processing peak ceiling.");
+        var output = await Exporter.RunAsync(spec, default);
+        using var measurement = MediaProcess.Start("ffmpeg", ["-hide_banner", "-nostdin", "-i", output.Path,
+            "-vn", "-af", Loudness.Target + ":print_format=json", "-f", "null", "-"]);
+        var stderr = measurement.StandardError.ReadToEndAsync();
+        var stdout = measurement.StandardOutput.ReadToEndAsync();
+        await measurement.WaitForExitAsync();
+        var report = await stderr;
+        await stdout;
+        if (measurement.ExitCode != 0) throw new Exception(report);
+        using var json = JsonDocument.Parse(report[report.LastIndexOf('{')..(report.LastIndexOf('}') + 1)]);
+        var peak = double.Parse(json.RootElement.GetProperty("input_tp").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+        var integrated = double.Parse(json.RootElement.GetProperty("input_i").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+        if (peak > -1 || integrated > -15)
+            throw new Exception($"Peak-limited export should remain quieter, with AAC headroom: {integrated} LUFS / {peak} dBTP.");
+    });
+    await Case("normalization can attenuate an already loud source", async () => {
+        var pcm = Path.Combine(run, "attenuated.f32");
+        await Ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.9*sin(2*PI*1000*t):s=48000:d=1",
+            "-af", Loudness.GainFilter(-4, -0.9), "-f", "f32le", pcm);
+        var samples = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(await File.ReadAllBytesAsync(pcm)).ToArray();
+        if (Math.Abs(samples.Max(x => Math.Abs(x)) - 0.9 * Math.Pow(10, -10d / 20)) > 0.000001)
+            throw new Exception("Already loud audio was not attenuated by 10 dB.");
+    });
     await Case("normalized silence remains silent", async () => {
         var silentAudio = Path.Combine(run, "silent-audio.mp4");
         await Ffmpeg("-i", fixture, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",

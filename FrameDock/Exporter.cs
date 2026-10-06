@@ -62,7 +62,9 @@ internal static class OutputNames
         var a = audio is null ? "mute" : $"a{audio}";
         var s = burnSubtitle ? $"burn{subtitle?.ToString(CultureInfo.InvariantCulture) ?? "none"}" : "suboff";
         var rotationKey = rotation == 0 ? "" : $"|rot{rotation}";
-        var key = $"{SourceState(media.Path)}|{start:R}|{end:R}|{a}|{s}|{mode}|{extension}{rotationKey}";
+        // Normalized exports from the old dynamic compressor must not be reused as fixed-gain audio.
+        var loudnessKey = normalizeAudio ? $"|{Loudness.AlgorithmVersion}" : "";
+        var key = $"{SourceState(media.Path)}|{start:R}|{end:R}|{a}|{s}|{mode}|{extension}{rotationKey}{loudnessKey}";
         return Path.Combine(Path.GetDirectoryName(media.Path)!,
             $"{Safe(Path.GetFileNameWithoutExtension(media.Path))}__{Time(start)}-{Time(end)}__{a}_{s}_{mode}_{Id(key)}{extension}");
     }
@@ -249,7 +251,7 @@ internal static class Exporter
                 Add("-c:v", codec, "-preset", "fast", "-crf", codec == "libx265" ? "20" : "18");
                 Add("-fps_mode", "passthrough", "-enc_time_base:v", "filter");
                 if (audioFilter is not null)
-                    Add("-af", $"atrim=start={MediaProcess.Time(spec.Start)}:end={MediaProcess.Time(spec.End)},{audioFilter}", "-c:a", "aac", "-b:a", "192k", "-ar", "48000");
+                    Add("-af", $"atrim=start={MediaProcess.Time(spec.Start)}:end={MediaProcess.Time(spec.End)},{audioFilter}", "-c:a", "aac", "-b:a", "320k", "-ar", "48000");
                 else if (spec.AudioIndex is not null) Add("-c:a", "copy");
             }
             Add(temporary);
