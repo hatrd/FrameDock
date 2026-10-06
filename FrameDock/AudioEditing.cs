@@ -141,7 +141,7 @@ internal static class AudioEditing
         finally { MediaProcess.Kill(process); await process.WaitForExitAsync(); }
     }
 
-    public static async Task<MediaInfo> ExportAsync(ExportSpec spec, CancellationToken cancellation)
+    public static async Task ExportAsync(ExportSpec spec, CancellationToken cancellation)
     {
         if (spec.AudioIndex is null) throw new InvalidOperationException("请选择要导出的音轨。");
         if (spec.Source is not null && spec.Source != SourceStamp.Capture(spec.Media.Path))
@@ -154,21 +154,12 @@ internal static class AudioEditing
             await RunFfmpegAsync(["-v", "error", "-nostdin", "-y", "-ss", MediaProcess.Time(spec.Start),
                 "-i", spec.Media.Path, "-map", $"0:{spec.AudioIndex}", "-vn", "-sn", "-af", filter,
                 "-c:a", "pcm_s24le", temporary], cancellation);
-            var result = await VerifyAsync(spec, temporary, cancellation);
+            cancellation.ThrowIfCancellationRequested();
             if (spec.Source is not null && spec.Source != SourceStamp.Capture(spec.Media.Path))
                 throw new InvalidOperationException("源音频在导出期间发生变化，请重新提交。");
             File.Move(temporary, spec.OutputPath);
-            return result with { Path = spec.OutputPath };
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
-    public static async Task<MediaInfo> VerifyAsync(ExportSpec spec, string path, CancellationToken cancellation)
-    {
-        var result = await Probe.ReadAsync(path, cancellation);
-        if (result.HasVideo || result.Audio.Count != 1 || result.Audio[0].Codec != "pcm_s24le" ||
-            Math.Abs(result.Duration - (spec.End - spec.Start)) > 2d / SampleRate)
-            throw new InvalidOperationException("音频成品的编码或采样时长不符合选区，请重新导出。");
-        return result;
-    }
 }

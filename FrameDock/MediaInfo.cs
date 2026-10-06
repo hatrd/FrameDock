@@ -7,7 +7,7 @@ namespace FrameDock;
 internal sealed record MediaTrack(int Index, string Codec, string Label, bool IsDefault);
 internal sealed record MediaInfo(string Path, double Duration, string VideoCodec,
     IReadOnlyList<MediaTrack> Audio, IReadOnlyList<MediaTrack> Subtitles,
-    double TimelineOrigin = 0, string VideoTimeBase = "1/1000", VerifiedTimeline? Verified = null)
+    double TimelineOrigin = 0, string VideoTimeBase = "1/1000")
 {
     public bool HasVideo => VideoCodec.Length > 0;
 }

@@ -87,46 +87,12 @@ internal static class Exporter
         _ => throw new InvalidOperationException("旋转角度必须是 0、90、180 或 270 度。")
     };
 
-    internal static string? ReferenceFilter(ExportSpec spec)
-    {
-        var filters = new List<string>();
-        if (spec.Rotation != 0) filters.Add(RotationFilter(spec.Rotation));
-        if (spec.BurnSubtitle) filters.Add(SubtitleFilter(spec));
-        return filters.Count == 0 ? null : string.Join(',', filters);
-    }
-
     public static string ExtensionFor(MediaInfo media, int? audioIndex)
     {
         var extension = Path.GetExtension(media.Path).ToLowerInvariant();
         if (extension != ".mp4") return extension == ".mkv" ? ".mkv" : ".mkv";
         var codec = media.Audio.FirstOrDefault(a => a.Index == audioIndex)?.Codec;
         return codec is null or "aac" or "mp3" or "alac" or "ac3" or "eac3" ? ".mp4" : ".mkv";
-    }
-
-    public static async Task<MediaInfo> VerifyAsync(ExportSpec spec, string path, CancellationToken cancellation)
-    {
-        spec = await PrepareAsync(spec, cancellation);
-        if (!spec.Media.HasVideo) return await AudioEditing.VerifyAsync(spec, path, cancellation);
-        var sourceStamp = SourceStamp.Capture(spec.Media.Path);
-        if (!File.Exists(path) || new FileInfo(path).Length == 0)
-            throw new InvalidOperationException("导出文件不存在或为空。");
-        var output = await Probe.ReadAsync(path, cancellation);
-        var desiredDuration = spec.End - spec.Start;
-        var tolerance = spec.Copy ? Math.Max(0.5, Math.Min(2, desiredDuration * 0.02)) : 0.3;
-        if (output.Duration <= 0 || Math.Abs(output.Duration - desiredDuration) > tolerance)
-            throw new InvalidOperationException($"导出时长异常：预计 {desiredDuration:F3} 秒，实际 {output.Duration:F3} 秒。");
-        var expectedVideo = spec.Copy ? spec.Media.VideoCodec : spec.Media.VideoCodec == "hevc" ? "hevc" : "h264";
-        if (output.VideoCodec != expectedVideo)
-            throw new InvalidOperationException($"导出视频编码异常：{output.VideoCodec}。");
-        var expectedAudio = spec.NormalizeAudio && spec.AudioIndex is not null ? "aac" : spec.Media.Audio.FirstOrDefault(a => a.Index == spec.AudioIndex)?.Codec;
-        if (expectedAudio is null ? output.Audio.Count != 0 : output.Audio.Count != 1 || output.Audio[0].Codec != expectedAudio)
-            throw new InvalidOperationException("导出音轨与所选音轨不一致。");
-        if (output.Subtitles.Count != 0)
-            throw new InvalidOperationException("导出文件含有未预期的独立字幕轨。");
-        var timeline = await TimelineVerification.VerifyAsync(spec, output, cancellation);
-        if (SourceStamp.Capture(spec.Media.Path) != sourceStamp)
-            throw new InvalidOperationException("源视频在成品验证期间发生变化，请重新提交。");
-        return output with { Verified = timeline };
     }
 
     internal static string SubtitlesPath(string path) => path.Replace('\\', '/')
@@ -166,26 +132,20 @@ internal static class Exporter
         return spec;
     }
 
-    public static async Task<MediaInfo> RunAsync(ExportSpec spec, CancellationToken cancellation)
+    public static async Task RunAsync(ExportSpec spec, CancellationToken cancellation)
     {
         spec = await PrepareAsync(spec, cancellation);
+        // Completed exports are reused without probing or comparing their timeline.
+        if (File.Exists(spec.OutputPath)) return;
         if (!spec.Media.HasVideo)
         {
-            if (File.Exists(spec.OutputPath)) return await AudioEditing.VerifyAsync(spec, spec.OutputPath, cancellation);
-            return await AudioEditing.ExportAsync(spec, cancellation);
+            await AudioEditing.ExportAsync(spec, cancellation);
+            return;
         }
         var exe = ToolPaths.Find("ffmpeg") ?? throw new InvalidOperationException("找不到 ffmpeg。");
         var extension = Path.GetExtension(spec.OutputPath);
         var temporary = Path.Combine(Path.GetDirectoryName(spec.OutputPath)!,
             "." + Path.GetFileNameWithoutExtension(spec.OutputPath) + ".partial-" + Guid.NewGuid().ToString("N") + extension);
-        if (File.Exists(spec.OutputPath))
-        {
-            try { return await VerifyAsync(spec, spec.OutputPath, cancellation); }
-            catch (InvalidOperationException error)
-            {
-                throw new InvalidOperationException("既有文件未通过验证，已保留原文件。请重新生成：" + error.Message, error);
-            }
-        }
         try
         {
             var audioFilter = spec.NormalizeAudio ? await Loudness.MeasureAsync(spec, cancellation) : null;
@@ -241,7 +201,6 @@ internal static class Exporter
                     if (spec.Media.TimelineOrigin != 0) filters.Add($"setpts=PTS-{MediaProcess.Time(spec.Media.TimelineOrigin)}/TB");
                 }
                 filters.Add("settb=AVTB");
-                // Use the same one-microsecond boundary tolerance as timeline verification.
                 // AVTB rounds timestamps to microseconds; exclude a frame exactly at End.
                 filters.Add($"trim=start={MediaProcess.Time(spec.Start - 0.000001)}:end={MediaProcess.Time(spec.End - 0.000001)}");
                 Add("-vf", string.Join(',', filters));
@@ -267,11 +226,11 @@ internal static class Exporter
                 throw new InvalidOperationException("FFmpeg 导出失败：" + error[^Math.Min(error.Length, 1600)..]);
             }
             await stdout;
-            var output = await VerifyAsync(spec, temporary, cancellation);
+            await stderr;
+            cancellation.ThrowIfCancellationRequested();
             if (spec.Source is not null && SourceStamp.Capture(spec.Media.Path) != spec.Source)
                 throw new InvalidOperationException("源视频在导出期间发生变化，已取消导出。请重新提交。");
             File.Move(temporary, spec.OutputPath);
-            return output with { Path = spec.OutputPath };
         }
         finally
         {

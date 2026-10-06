@@ -10,7 +10,7 @@
     <Compile Include="../../FrameDock/Exporter.cs" Link="Exporter.cs" />
     <Compile Include="../../FrameDock/Loudness.cs" Link="Loudness.cs" />
     <Compile Include="../../FrameDock/AudioEditing.cs" Link="AudioEditing.cs" />
-    <Compile Include="../../FrameDock/TimelineVerification.cs" Link="TimelineVerification.cs" />
+    <Compile Include="../../FrameDock/MediaProcess.cs" Link="MediaProcess.cs" />
     <Compile Include="../../FrameDock/MpvClient.cs" Link="MpvClient.cs" />
   </ItemGroup>
 </Project>

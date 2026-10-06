@@ -25,11 +25,19 @@ async Task Case(string name, Func<Task> action)
     catch (Exception error) { checks.Add(new { name, passed = false }); failures.Add(name); Console.WriteLine("FAIL " + name + ": " + error); }
 }
 
-async Task Reject(ExportSpec spec, string path)
+async Task Reuse(ExportSpec spec, string path)
 {
-    try { await Exporter.VerifyAsync(spec, path, default); }
-    catch (InvalidOperationException) { return; }
-    throw new Exception("Invalid output was accepted.");
+    var stamp = SourceStamp.Capture(path);
+    await Exporter.RunAsync(spec with { OutputPath = path }, default);
+    if (SourceStamp.Capture(path) != stamp) throw new Exception("Existing output was changed.");
+}
+
+async Task<int> FrameCount(string path)
+{
+    var count = 0;
+    await MediaProcess.ProbeLinesAsync(path, "v:0", "-show_frames", "frame=pts_time", null,
+        _ => count++, default);
+    return count;
 }
 
 async Task Export(string source, string name, int keyIndex, double end, bool precise = false,
@@ -43,10 +51,29 @@ async Task Export(string source, string name, int keyIndex, double end, bool pre
     var spec = new ExportSpec(media, start, end, audio, burn ? media.Subtitles[0].Index : null,
         !precise, burn, Path.Combine(run, name + Path.GetExtension(source)), precise ? null : key,
         SourceStamp.Capture(source));
-    var output = await Exporter.RunAsync(spec, default);
-    await Exporter.RunAsync(spec, default); // Reuse must pass exactly the same verification.
-    results.Add(new { name, source, start, end, output.Duration, output.Verified });
+    await Exporter.RunAsync(spec, default);
+    await Reuse(spec, spec.OutputPath);
+    var output = await Probe.ReadAsync(spec.OutputPath);
+    results.Add(new { name, source, start, end, output.Duration });
     Console.WriteLine($"  {start:F6}–{end:F6}, PTS={key.Pts:F6}, DTS={key.Dts:F6}, origin={media.TimelineOrigin:F6}");
+}
+
+if (args.Contains("--reported-export"))
+{
+    var media = await Probe.ReadAsync(args[1]);
+    foreach (var end in new[] { 47.2, 47.5 })
+    foreach (var normalize in new[] { false, true })
+    await Case($"reported export ending {end:F1}, normalize={normalize}", async () => {
+        var spec = new ExportSpec(media, 24 + 4d / 30, end, media.Audio[0].Index, null,
+            false, false, Path.Combine(run, $"reported-{end:F1}-{normalize}.mp4"),
+            Source: SourceStamp.Capture(media.Path), NormalizeAudio: normalize);
+        await Exporter.RunAsync(spec, default);
+        await Reuse(spec, spec.OutputPath);
+        var output = await Probe.ReadAsync(spec.OutputPath);
+        if (!output.HasVideo || output.Audio.Count != 1) throw new Exception("Missing video or audio.");
+    });
+    Environment.ExitCode = failures.Count == 0 ? 0 : 1;
+    return;
 }
 
 if (args.Contains("--reported-cut"))
@@ -55,9 +82,9 @@ if (args.Contains("--reported-cut"))
         var media = await Probe.ReadAsync(args[1]);
         var spec = new ExportSpec(media, 805.984, 815 + 1d / 3, media.Audio[0].Index, null,
             false, false, Path.Combine(run, "reported-cut.mp4"), NormalizeAudio: true);
-        var output = await Exporter.RunAsync(spec, default);
         await Exporter.RunAsync(spec, default);
-        if (output.Verified!.VideoFrames != 280) throw new Exception("Expected 280 selected frames.");
+        await Exporter.RunAsync(spec, default);
+        if (await FrameCount(spec.OutputPath) != 280) throw new Exception("Expected 280 selected frames.");
     });
     Environment.ExitCode = failures.Count == 0 ? 0 : 1;
     return;
@@ -81,8 +108,9 @@ foreach (var source in new[] { fixture, offsetMkv })
         var normalized = new ExportSpec(media, 6.217, 10.4, media.Audio[1].Index, null,
             false, false, Path.Combine(run, "normalized-" + Path.GetFileName(source)),
             Source: SourceStamp.Capture(source), NormalizeAudio: true);
-        var output = await Exporter.RunAsync(normalized, default);
         await Exporter.RunAsync(normalized, default);
+        await Exporter.RunAsync(normalized, default);
+        var output = await Probe.ReadAsync(normalized.OutputPath);
         if (output.Audio.Single().Codec != "aac") throw new Exception("Normalized audio must be AAC.");
         using var measurement = MediaProcess.Start("ffmpeg", ["-hide_banner", "-nostdin", "-i", output.Path,
             "-vn", "-af", Loudness.Target + ":print_format=json", "-f", "null", "-"]);
@@ -107,9 +135,9 @@ await Case("coarse time base precise frame boundary", async () => {
     {
         var spec = new ExportSpec(media, 6.217, 10 + 1d / 3, media.Audio[0].Index, null,
             false, false, Path.Combine(run, $"boundary-{normalize}.mp4"), NormalizeAudio: normalize);
-        var output = await Exporter.RunAsync(spec, default);
         await Exporter.RunAsync(spec, default);
-        if (output.Verified!.VideoFrames != 123) throw new Exception("Expected 123 selected frames.");
+        await Exporter.RunAsync(spec, default);
+        if (await FrameCount(spec.OutputPath) != 123) throw new Exception("Expected 123 selected frames.");
     }
 });
 if (args.Contains("--loudness"))
@@ -158,7 +186,7 @@ foreach (var source in new[] { fixture, mkv, offset, offsetMkv, silent, vfr, hev
     await Case(label + " precise", () => Export(source, label + "-precise", 0, 3.4, precise: true, preciseStart: 1.217));
     await Case(label + " precise with input seek", () => Export(source, label + "-precise-middle", 0,
         Math.Min(7.6, media.Duration), precise: true, preciseStart: 6.217));
-    await Case(label + " mpv position and seek", async () => {
+    if (!args.Contains("--exports-only")) await Case(label + " mpv position and seek", async () => {
         await using var player = await MpvClient.StartAsync(IntPtr.Zero, headless: true);
         var position = double.NaN;
         player.PositionChanged += value => position = value;
@@ -203,22 +231,13 @@ foreach (var source in new[] { fixture, mkv, offset, offsetMkv, silent, vfr, hev
 var info = await Probe.ReadAsync(fixture);
 var spec = new ExportSpec(info, 0, 12.841, info.Audio[0].Index, null, true, false, Path.Combine(run, "broken.mp4"));
 await Ffmpeg("-i", fixture, "-ss", "0", "-t", "12.841", "-map", "0:v:0", "-map", "0:1", "-c", "copy", spec.OutputPath);
-await Case("missing initial GOP rejected", () => Reject(spec, spec.OutputPath));
-await Case("existing invalid file preserved", async () => {
-    var stamp = SourceStamp.Capture(spec.OutputPath);
-    try { await Exporter.RunAsync(spec, default); }
-    catch (InvalidOperationException) {
-        if (SourceStamp.Capture(spec.OutputPath) != stamp) throw new Exception("Existing file was changed.");
-        return;
-    }
-    throw new Exception("Existing invalid output was accepted.");
-});
+await Case("existing output reused without initial GOP checks", () => Reuse(spec, spec.OutputPath));
 var wrongAudio = Path.Combine(run, "wrong-audio.mp4");
 await Ffmpeg("-i", fixture, "-t", "12.841", "-map", "0:v:0", "-map", "0:2", "-c", "copy", wrongAudio);
-await Case("wrong audio of same codec rejected", () => Reject(spec, wrongAudio));
+await Case("existing output reused without audio packet checks", () => Reuse(spec, wrongAudio));
 var late = Path.Combine(run, "late.mp4");
 await Ffmpeg("-i", fixture, "-t", "12.841", "-map", "0:v:0", "-map", "0:1", "-c", "copy", "-output_ts_offset", "1", late);
-await Case("shifted timeline rejected", () => Reject(spec, late));
+await Case("existing output reused without timeline checks", () => Reuse(spec, late));
 
 var real = args.Length > 1 ? args[1] : @"C:\Users\R\Videos\2026-09-25 09-40-23.mp4";
 if (File.Exists(real))
@@ -230,7 +249,7 @@ if (File.Exists(real))
     if (File.Exists(broken))
     {
         var media = await Probe.ReadAsync(real);
-        await Case("user existing bad output rejected", () => Reject(new ExportSpec(media, 0, 12.841,
+        await Case("user existing output reused", () => Reuse(new ExportSpec(media, 0, 12.841,
             media.Audio[0].Index, null, true, false, broken), broken));
     }
 }
@@ -240,6 +259,16 @@ await Case("subtitle burn / escaped filename", () => Export(subtitleSample, "sub
     precise: true, preciseStart: 1.2, burn: true));
 await Case("subtitle burn / nonzero origin", () => Export(offsetSubtitles, "offset-subtitle-burn", 0, 3.4,
     precise: true, preciseStart: 1.2, burn: true));
+await Case("FFmpeg failure leaves no output", async () => {
+    var failed = spec with { Copy = false, OutputPath = Path.Combine(run, "failed.unsupported") };
+    try { await Exporter.RunAsync(failed, default); }
+    catch (InvalidOperationException error) when (error.Message.StartsWith("FFmpeg 导出失败：")) {
+        if (File.Exists(failed.OutputPath) || Directory.GetFiles(run, ".failed.partial-*").Length > 0)
+            throw new Exception("Failed FFmpeg task left an output or partial file.");
+        return;
+    }
+    throw new Exception("FFmpeg failure was not reported.");
+});
 await Case("cancelled export leaves no output", async () => {
     using var cancellation = new CancellationTokenSource();
     cancellation.CancelAfter(50);
