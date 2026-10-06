@@ -1190,21 +1190,9 @@ internal sealed class MainForm : Form
                 throw new InvalidOperationException("源视频已变化，请重新打开后选封面。");
             if (File.Exists(output))
             {
-                try
-                {
-                    await Exporter.VerifyAsync(spec, output, CancellationToken.None);
-                }
-                catch (Exception error) when (error is InvalidOperationException or FormatException)
-                {
-                    var archived = ArchiveInvalid(output);
-                    SetStatus("既有片段验证失败，原文件保留在 " + archived + "；正在重新生成。");
-                }
-                if (File.Exists(output))
-                {
-                    if (cover is not null) await SaveCoverAsync(cover, OutputNames.ClipCover(output, cover.Media, cover.Position, cover.SubtitleIndex, cover.Rotation));
-                    SetStatus((cover is null ? "片段已完成：" : "片段与封面已保存：") + output);
-                    return;
-                }
+                if (cover is not null) await SaveCoverAsync(cover, OutputNames.ClipCover(output, cover.Media, cover.Position, cover.SubtitleIndex, cover.Rotation));
+                SetStatus((cover is null ? "片段已完成：" : "片段与封面已保存：") + output);
+                return;
             }
             if (activePaths.Contains(output))
             {
@@ -1284,18 +1272,12 @@ internal sealed class MainForm : Form
     {
         try
         {
-            var output = await Exporter.RunAsync(job.Spec, job.Cancellation.Token);
+            await Exporter.RunAsync(job.Spec, job.Cancellation.Token);
             if (job.Cover is { } cover)
                 await SaveCoverAsync(cover, OutputNames.ClipCover(job.Spec.OutputPath, cover.Media, cover.Position, cover.SubtitleIndex, cover.Rotation));
             UpdateJob(job, "完成");
-            if (!output.HasVideo)
-            {
-                SetStatus($"音频已保存（核实采样时长 {output.Duration:F6} 秒）：{job.Spec.OutputPath}");
-                return;
-            }
-            var timeline = output.Verified!;
-            SetStatus($"{(job.Cover is null ? "片段" : "片段与封面")}已保存（核实源视频首帧 {Clock(timeline.FirstVideoSourcePosition)}，末帧 {Clock(timeline.LastVideoSourcePosition)}，" +
-                $"成品时长 {output.Duration:F3} 秒）：{job.Spec.OutputPath}");
+            var label = !job.Spec.Media.HasVideo ? "音频" : job.Cover is null ? "片段" : "片段与封面";
+            SetStatus($"{label}已保存：{job.Spec.OutputPath}");
         }
         catch (OperationCanceledException) { UpdateJob(job, "取消"); }
         catch (Exception error) { job.Failure = error.Message; UpdateJob(job, "失败"); SetStatus(error.Message); }

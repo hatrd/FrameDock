@@ -18,10 +18,17 @@ internal static class Program
         var settingsPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
             "../../../../.scratch/window-tests", Guid.NewGuid().ToString("N"), "settings.json"));
         using var form = new MainForm(settingsPath: settingsPath);
+        if (args.Contains("--export-verification") || args.Contains("--background"))
+        {
+            form.Opacity = 0;
+            form.ShowInTaskbar = false;
+        }
         form.Shown += async (_, _) => {
             try
             {
-                if (args.Contains("--bpm-selection"))
+                if (args.Contains("--export-verification"))
+                    await TestExportWithoutVerificationAsync(form, args[1], args[2]);
+                else if (args.Contains("--bpm-selection"))
                     await TestBpmSelectionAsync(form);
                 else if (args.Contains("--audio-loops"))
                     await TestAudioLoopsAsync(form);
@@ -67,6 +74,49 @@ internal static class Program
         Console.WriteLine("PASS: " + name);
     }
     private static bool Near(double actual, double expected, double tolerance = 0.002) => Math.Abs(actual - expected) < tolerance;
+
+    private static async Task TestExportWithoutVerificationAsync(MainForm form, string source, string coverPath)
+    {
+        // Load while hidden so this regression needs no desktop or preview player.
+        form.Hide();
+        await CallAsync(form, "OpenVideoAsync", source);
+        var media = Field<MediaInfo>(form, "media");
+        var bar = Field<RangeBar>(form, "range");
+        bar.Start = 24 + 4d / 30; bar.End = media.Duration;
+        Field<CheckBox>(form, "normalizeAudio").Checked = true;
+        SetField(form, "rotation", 90);
+        var coverType = typeof(MainForm).GetNestedType("CoverFrame", BindingFlags.NonPublic)!;
+        var cover = Activator.CreateInstance(coverType,
+            new object?[] { media, 29d, null, File.ReadAllBytes(coverPath), SourceStamp.Capture(source), 90 })!;
+        SetField(form, "selectedCover", cover);
+        var outputPath = OutputNames.Clip(media, bar.Start, bar.End, media.Audio[0].Index, null,
+            false, false, ".mp4", 90, true);
+        await CallAsync(form, "SubmitExportAsync", true);
+        var queue = Field<ListBox>(form, "jobs");
+        await WaitUntilAsync(() => queue.Items.Cast<object>().All(job =>
+            (string)job.GetType().GetProperty("State")!.GetValue(job)! is "完成" or "失败"), 120000);
+        Check(queue.Items.Cast<object>().All(job =>
+            (string)job.GetType().GetProperty("State")!.GetValue(job)! == "完成"),
+            "reported normalized export completes through the queue: " + string.Join("; ", queue.Items.Cast<object>()));
+        Check(File.Exists(outputPath) && new FileInfo(outputPath).Length > 0,
+            "reported video survives export completion");
+        Check(Field<Label>(form, "status").Text.StartsWith("片段与封面已保存："),
+            "completion status reports the saved clip and cover");
+        var bundled = OutputNames.ClipCover(outputPath, media, 29, null, 90);
+        Check(File.Exists(bundled) && File.ReadAllBytes(bundled).SequenceEqual(File.ReadAllBytes(coverPath)),
+            "the supplied cover is saved alongside the clip");
+        var stamp = SourceStamp.Capture(outputPath);
+        var count = queue.Items.Count;
+        await CallAsync(form, "SubmitExportAsync", true);
+        Check(queue.Items.Count == count && SourceStamp.Capture(outputPath) == stamp,
+            "resubmitting reuses the existing clip without archiving or re-exporting");
+        using var bitmap = new Bitmap(form.Width, form.Height);
+        form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
+        var screenshot = Path.GetFullPath(".scratch/export-verification-ui.png");
+        Directory.CreateDirectory(Path.GetDirectoryName(screenshot)!);
+        bitmap.Save(screenshot);
+        Console.WriteLine("Saved clip: " + outputPath);
+    }
 
     private static void TestExportQueueMenu(MainForm form)
     {
@@ -154,7 +204,7 @@ internal static class Program
             form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
             bitmap.Save(Path.Combine(scratch, $"workspace-{size.Width}x{size.Height}-{(expanded ? "expanded" : "compact")}.png"));
         }
-        using var help = new ShortcutHelpForm();
+        using var help = new ShortcutHelpForm { Opacity = form.Opacity, ShowInTaskbar = false };
         help.Show(form);
         help.PerformLayout();
         using var helpBitmap = new Bitmap(help.Width, help.Height);
@@ -412,7 +462,7 @@ internal static class Program
             var rotatedJob = Field<ListBox>(form, "jobs").Items.Cast<object>().Last();
             var rotatedSpec = (ExportSpec)rotatedJob.GetType().GetProperty("Spec")!.GetValue(rotatedJob)!;
             Check(!rotatedSpec.Copy && rotatedSpec.Rotation == angle && File.Exists(rotatedSpec.OutputPath),
-                $"{angle} degree video exports and passes decoded frame verification");
+                $"{angle} degree video exports successfully");
             await CheckVideoSizeAsync(rotatedSpec.OutputPath, expected.Width, expected.Height);
             Check(ReferenceEquals(lockedBeforeRotation, Field<object>(form, "selectedCover")), "rotation preserves locked cover");
         }
@@ -649,7 +699,10 @@ internal static class Program
         var job = queue.Items.Cast<object>().Last();
         var spec = (ExportSpec)job.GetType().GetProperty("Spec")!.GetValue(job)!;
         Check((string)job.GetType().GetProperty("State")!.GetValue(job)! == "完成", "audio export completes through the background queue: " + job);
-        await AudioEditing.VerifyAsync(spec, spec.OutputPath, default);
+        var audioOutput = await Probe.ReadAsync(spec.OutputPath);
+        Check(!audioOutput.HasVideo && audioOutput.Audio.Single().Codec == "pcm_s24le" &&
+            Near(audioOutput.Duration, spec.End - spec.Start, 2d / AudioEditing.SampleRate),
+            "audio export preserves PCM encoding and selected sample duration");
         using (var decoder = MediaProcess.Start("ffmpeg", ["-v", "error", "-i", spec.OutputPath, "-f", "f32le", "-"]))
         {
             var error = decoder.StandardError.ReadToEndAsync();
